@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 > nul
-title YT Downloader - build
+title Media Downloader - build
 
 echo ==========================================
-echo   YT Downloader - сборка .exe
+echo   Media Downloader - сборка .exe
 echo ==========================================
 echo.
 
@@ -33,7 +33,7 @@ echo Собираю .exe (это 1-3 минуты)...
 echo.
 
 set BUILD_ARGS=--noconfirm --clean --onefile --windowed ^
-    --name "YT-Downloader" ^
+    --name "Media-Downloader" ^
     --collect-all ttkbootstrap ^
     --collect-all yt_dlp ^
     --collect-all yt_dlp_ejs ^
@@ -51,7 +51,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo ==========================================
-echo   Готово: dist\YT-Downloader.exe
+echo   Готово: dist\Media-Downloader.exe
 echo ==========================================
 echo.
 pause

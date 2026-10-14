@@ -34,7 +34,12 @@ def provider_dir() -> Path:
     # Не кладём 165 МБ рядом с .exe: папка может быть в OneDrive/Program Files.
     # Используем локальное хранилище пользователя.
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
-    return Path(base) / "YT-Downloader" / "pot"
+    new = Path(base) / "Media-Downloader" / "pot"
+    legacy = Path(base) / "YT-Downloader" / "pot"
+    # Совместимость: если провайдер уже стоял под старым именем — не качаем заново.
+    if not new.exists() and legacy.exists():
+        return legacy
+    return new
 
 
 def server_dir() -> Path:

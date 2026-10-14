@@ -1,24 +1,24 @@
 <div align="center">
 
-<img src="icon.png" width="96" alt="YT Downloader">
+<img src="icon.png" width="96" alt="Media Downloader">
 
-# YT Downloader
+# Media Downloader
 
-**Скачивайте видео, аудио и плейлисты с YouTube в один клик — без рекламы, лимитов и регистрации.**
+**Скачивайте видео и аудио с YouTube, VK, RuTube и сотен других сайтов — в один клик. Без рекламы, лимитов и регистрации.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](#требования)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](#-требования)
 [![Powered by yt-dlp](https://img.shields.io/badge/powered%20by-yt--dlp-red)](https://github.com/yt-dlp/yt-dlp)
-[![Release](https://img.shields.io/github/v/release/TTsanchez/yt-downloader?label=release)](../../releases/latest)
+[![Release](https://img.shields.io/github/v/release/TTsanchez/media-downloader?label=release)](../../releases/latest)
 
-[Скачать](#-скачать) · [Возможности](#-возможности) · [Как пользоваться](#-как-пользоваться) · [English](README.en.md)
+[Скачать](#-скачать) · [Возможности](#-возможности) · [Сайты](#-поддерживаемые-сайты) · [Как пользоваться](#-как-пользоваться) · [English](README.en.md)
 
 </div>
 
 ---
 
-YT Downloader — простая десктопная программа для Windows. Работает локально: ничего не отправляет на сторонние серверы, не показывает рекламу и не ограничивает количество загрузок. Внутри используется мощный движок [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Media Downloader — простая десктопная программа для Windows. Работает локально: ничего не отправляет на сторонние серверы, не показывает рекламу и не ограничивает количество загрузок. Внутри используется мощный движок [yt-dlp](https://github.com/yt-dlp/yt-dlp), поэтому поддерживаются сотни сайтов.
 
 ![Главное окно](docs/screenshots/01-format.png)
 
@@ -36,12 +36,28 @@ YT Downloader — простая десктопная программа для 
 - 💾 **Запоминает настройки** между запусками
 - 📦 **Портативный `.exe`** — не требует установки Python
 
+## 🌍 Поддерживаемые сайты
+
+Благодаря yt-dlp программа работает не только с YouTube. Популярные площадки:
+
+| Видео | Аудио и соцсети |
+|---|---|
+| YouTube, Shorts, VK, RuTube | SoundCloud, Bandcamp |
+| Dailymotion, Vimeo, Twitch | TikTok, Instagram\*, Twitter/X |
+| Одноклассники, Rutube Live | Reddit, Bilibili |
+
+<sub>\* Некоторые сайты требуют cookies или могут быть недоступны в отдельных регионах.</sub>
+
+Полный список — [supported sites yt-dlp](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) (1000+). Поскольку yt-dlp постоянно обновляется, программа со временем поддерживает всё больше площадок.
+
+> **Основной фокус проекта — YouTube.** Именно для него реализованы cookies, PO Token и автоповтор. Для остальных сайтов работает стандартный механизм yt-dlp.
+
 ## 📥 Скачать
 
 ### Вариант 1. Готовый .exe (проще всего)
 
 1. Откройте страницу [**Releases**](../../releases/latest)
-2. Скачайте `YT-Downloader.exe`
+2. Скачайте `Media-Downloader.exe`
 3. Запустите — установка не нужна
 
 > Windows может показать предупреждение SmartScreen («Неизвестный издатель»), потому что файл не подписан цифровым сертификатом. Нажмите **«Подробнее» → «Выполнить в любом случае»**.
@@ -51,8 +67,8 @@ YT Downloader — простая десктопная программа для 
 Нужен [Python 3.10+](https://www.python.org/downloads/) (при установке отметьте **Add Python to PATH**).
 
 ```bat
-git clone https://github.com/TTsanchez/yt-downloader.git
-cd yt-downloader
+git clone https://github.com/TTsanchez/media-downloader.git
+cd media-downloader
 start.bat
 ```
 
@@ -71,7 +87,7 @@ python main.py
 
 ## 🚀 Как пользоваться
 
-1. **Вставьте ссылку** на видео или плейлист в поле сверху.
+1. **Вставьте ссылку** на видео, аудио или плейлист в поле сверху.
 2. Нажмите **«Получить информацию»** — появятся название, канал и длительность.
 3. На вкладке **«Формат»** выберите, что скачивать: лучшее качество, только видео или только аудио.
 4. Нажмите **«Скачать»**. Прогресс и журнал видны внизу окна.
@@ -109,7 +125,7 @@ python main.py
 3. Экспортируйте cookies в формате Netscape (`.txt`)
 4. «Настройки» → Cookies → **«Загрузить»**
 
-Данные cookies никуда не отправляются — они читаются локально и используются только для запросов к YouTube.
+Данные cookies никуда не отправляются — они читаются локально и используются только для запросов к сайту.
 
 ## 🧱 Компоненты для работы с YouTube
 
@@ -120,7 +136,7 @@ python main.py
 | **Deno** | Выполняет проверочный JS YouTube | Кнопка «Установить Deno» (через winget) |
 | **PO Token сервер** | Генерирует токены доступа | Кнопка «Установить PO Token» (нужны Node.js и Git) |
 
-PO Token сервер — это локальная Node.js-программа [bgutil](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). Она ставится один раз в `%LOCALAPPDATA%\YT-Downloader\pot` (~165 МБ), запускается сама при старте программы на `127.0.0.1:4416` и останавливается при выходе. Файлы никуда не отправляются.
+PO Token сервер — это локальная Node.js-программа [bgutil](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). Она ставится один раз в `%LOCALAPPDATA%\Media-Downloader\pot` (~165 МБ), запускается сама при старте программы на `127.0.0.1:4416` и останавливается при выходе. Файлы никуда не отправляются.
 
 > Если эти компоненты не установлены, обычные видео часто всё равно скачиваются. Они обязательны для возрастных, приватных и защищённых видео.
 
@@ -158,11 +174,12 @@ PO Token сервер — это локальная Node.js-программа [
 | `The page needs to be reloaded` | Нет PO Token — установите Deno и PO Token во вкладке «Настройки» |
 | `Confirm your age` | Возрастное ограничение — нужны cookies |
 | `This video is private` | Нужен доступ по ссылке для приглашённых |
+| `Unsupported URL` | Сайт не поддерживается или ссылка неверная. Проверьте список поддерживаемых сайтов yt-dlp |
 | `Video unavailable` | Видео удалено или недоступно в вашем регионе |
 
 ## ⬆️ Обновление
 
-YouTube периодически меняет внутреннюю защиту. Когда программа перестала работать, обновите движок:
+Сайты периодически меняют внутреннюю защиту. Когда программа перестала работать, обновите движок:
 
 ```bat
 py -m pip install -U yt-dlp
@@ -179,7 +196,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Сборка одного `.exe` (результат в `dist\YT-Downloader.exe`):
+Сборка одного `.exe` (результат в `dist\Media-Downloader.exe`):
 
 ```bat
 build_exe.bat
@@ -196,7 +213,7 @@ build_exe.bat
 
 ## ⚖️ Правовая заметка
 
-Скачивание контента без разрешения правообладателя нарушает Условия использования YouTube. Используйте программу только для материалов, на которые у вас есть право: собственное видео, Creative Commons, общественное достояние или контент с явного разрешения автора.
+Скачивание контента без разрешения правообладателя нарушает Условия использования сайтов. Используйте программу только для материалов, на которые у вас есть право: собственное видео, Creative Commons, общественное достояние или контент с явного разрешения автора.
 
 ## 📄 Лицензия
 

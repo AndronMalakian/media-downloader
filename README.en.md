@@ -1,24 +1,24 @@
 <div align="center">
 
-<img src="icon.png" width="96" alt="YT Downloader">
+<img src="icon.png" width="96" alt="Media Downloader">
 
-# YT Downloader
+# Media Downloader
 
-**Download YouTube videos, audio and playlists in one click — no ads, no limits, no sign-up.**
+**Download video and audio from YouTube, VK, RuTube and hundreds of other sites — in one click. No ads, no limits, no sign-up.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](#requirements)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](#-requirements)
 [![Powered by yt-dlp](https://img.shields.io/badge/powered%20by-yt--dlp-red)](https://github.com/yt-dlp/yt-dlp)
-[![Release](https://img.shields.io/github/v/release/TTsanchez/yt-downloader?label=release)](../../releases/latest)
+[![Release](https://img.shields.io/github/v/release/TTsanchez/media-downloader?label=release)](../../releases/latest)
 
-[Download](#-download) · [Features](#-features) · [Usage](#-usage) · [Русский](README.md)
+[Download](#-download) · [Features](#-features) · [Sites](#-supported-sites) · [Usage](#-usage) · [Русский](README.md)
 
 </div>
 
 ---
 
-YT Downloader is a simple desktop app for Windows. It runs entirely locally: nothing is sent to third-party servers, there are no ads and no download limits. Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+Media Downloader is a simple desktop app for Windows. It runs entirely locally: nothing is sent to third-party servers, there are no ads and no download limits. Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp), so hundreds of sites are supported.
 
 ![Main window](docs/screenshots/01-format.png)
 
@@ -36,12 +36,28 @@ YT Downloader is a simple desktop app for Windows. It runs entirely locally: not
 - 💾 **Remembers settings** between launches
 - 📦 **Portable `.exe`** — no Python required
 
+## 🌍 Supported sites
+
+Thanks to yt-dlp the app works beyond YouTube. Popular platforms:
+
+| Video | Audio and social |
+|---|---|
+| YouTube, Shorts, VK, RuTube | SoundCloud, Bandcamp |
+| Dailymotion, Vimeo, Twitch | TikTok, Instagram\*, Twitter/X |
+| Odnoklassniki, RuTube Live | Reddit, Bilibili |
+
+<sub>\* Some sites need cookies or may be unavailable in certain regions.</sub>
+
+Full list: [yt-dlp supported sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) (1000+).
+
+> **The project focuses on YouTube.** Cookies, PO Token and auto-retry are built for it. Other sites use yt-dlp's standard pipeline.
+
 ## 📥 Download
 
 ### Option 1. Ready-made .exe (easiest)
 
 1. Open the [**Releases**](../../releases/latest) page
-2. Download `YT-Downloader.exe`
+2. Download `Media-Downloader.exe`
 3. Run it — no installation needed
 
 > Windows SmartScreen may warn about an unknown publisher because the binary is not code-signed. Click **More info → Run anyway**.
@@ -51,8 +67,8 @@ YT Downloader is a simple desktop app for Windows. It runs entirely locally: not
 Requires [Python 3.10+](https://www.python.org/downloads/) (check **Add Python to PATH** during install).
 
 ```bat
-git clone https://github.com/TTsanchez/yt-downloader.git
-cd yt-downloader
+git clone https://github.com/TTsanchez/media-downloader.git
+cd media-downloader
 start.bat
 ```
 
@@ -71,7 +87,7 @@ python main.py
 
 ## 🚀 Usage
 
-1. **Paste a link** to a video or playlist.
+1. **Paste a link** to a video, audio track or playlist.
 2. Click **Get info** — title, channel and duration appear.
 3. On the **Format** tab choose what to download: best quality, video only, or audio only.
 4. Click **Download**. Progress and log appear at the bottom.
@@ -99,7 +115,7 @@ Needed when YouTube asks to confirm you're not a bot, and for age-restricted, pr
 
 **Option 1 — read directly from the browser.** Settings → Cookies → pick a browser.
 
-> **Chrome/Edge 127+ note.** Google switched to app-bound cookie encryption; the key is tied to the browser and cannot be read externally. Close the browser does **not** help. Firefox cookies are readable.
+> **Chrome/Edge 127+ note.** Google switched to app-bound cookie encryption; the key is tied to the browser and cannot be read externally. Closing the browser does **not** help. Firefox cookies are readable.
 
 **Option 2 — `cookies.txt` file (always works).**
 1. Install the **Cookie-Editor** extension in your browser
@@ -107,7 +123,7 @@ Needed when YouTube asks to confirm you're not a bot, and for age-restricted, pr
 3. Export cookies in Netscape format (`.txt`)
 4. Settings → Cookies → **Load**
 
-Cookies never leave your machine — they are read locally and used only for requests to YouTube.
+Cookies never leave your machine — they are read locally and used only for requests to the site.
 
 ## 🧱 YouTube components
 
@@ -118,7 +134,7 @@ Since 2025 YouTube requires a **PO Token** and a **JavaScript challenge**. Witho
 | **Deno** | Runs YouTube's JS challenge | "Install Deno" button (via winget) |
 | **PO Token server** | Generates access tokens | "Install PO Token" button (needs Node.js and Git) |
 
-The PO Token server is the local Node.js program [bgutil](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). It installs once to `%LOCALAPPDATA%\YT-Downloader\pot` (~165 MB), starts automatically on `127.0.0.1:4416` and stops on exit. Nothing is uploaded.
+The PO Token server is the local Node.js program [bgutil](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). It installs once to `%LOCALAPPDATA%\Media-Downloader\pot` (~165 MB), starts automatically on `127.0.0.1:4416` and stops on exit. Nothing is uploaded.
 
 ## 🌐 Network and YouTube blocking (VPN / proxy)
 
@@ -150,11 +166,12 @@ Empty means a direct connection. The local PO Token server (`127.0.0.1`) always 
 | `The page needs to be reloaded` | No PO Token — install Deno and PO Token on the Settings tab |
 | `Confirm your age` | Age-restricted — cookies needed |
 | `This video is private` | You need the invite link |
+| `Unsupported URL` | Site not supported or bad link. Check yt-dlp's supported sites |
 | `Video unavailable` | Removed or not available in your region |
 
 ## ⬆️ Updating
 
-YouTube changes its protections occasionally. When the app stops working, update the engine:
+Sites change their protections occasionally. When the app stops working, update the engine:
 
 ```bat
 py -m pip install -U yt-dlp
@@ -171,7 +188,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Build a single `.exe` (output in `dist\YT-Downloader.exe`):
+Build a single `.exe` (output in `dist\Media-Downloader.exe`):
 
 ```bat
 build_exe.bat
@@ -186,7 +203,7 @@ build_exe.bat
 
 ## ⚖️ Legal notice
 
-Downloading content without the rights holder's permission violates YouTube's Terms of Service. Use this app only for material you have the right to: your own videos, Creative Commons, public domain, or content you have explicit permission to use.
+Downloading content without the rights holder's permission violates the sites' Terms of Service. Use this app only for material you have the right to: your own videos, Creative Commons, public domain, or content you have explicit permission to use.
 
 ## 📄 License
 

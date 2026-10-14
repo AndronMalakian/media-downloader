@@ -30,7 +30,7 @@ def resource_path(name: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
 
-from downloader import DownloadProgress, YTDownloader
+from downloader import DownloadProgress, MediaDownloader
 from pot import (
     SERVER_HOST,
     SERVER_PORT,
@@ -57,7 +57,8 @@ from utils import (
     is_browser_running,
 )
 
-CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
+CONFIG_FILE = Path.home() / ".media_downloader_config.json"
+LEGACY_CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
 FFMPEG_URL = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest"
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -122,7 +123,7 @@ class VScroll(ttkb.Frame):
 
 class YTApp(ttkb.Window):
     def __init__(self):
-        super().__init__(title="YT Downloader", size=(960, 720), minsize=(880, 580))
+        super().__init__(title="Media Downloader", size=(960, 720), minsize=(880, 580))
         self._fit_to_screen()
         try:
             ico = resource_path("icon.ico")
@@ -131,7 +132,7 @@ class YTApp(ttkb.Window):
         except Exception:
             pass
         self._set_theme()
-        self.downloader = YTDownloader(progress_callback=self.on_progress)
+        self.downloader = MediaDownloader(progress_callback=self.on_progress)
         self.cookies_path: str | None = None
         self.is_downloading = False
         self.config = self._load_config()
@@ -178,8 +179,9 @@ class YTApp(ttkb.Window):
 
     def _load_config(self) -> dict:
         try:
-            if CONFIG_FILE.exists():
-                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             pass
         return {}
@@ -247,7 +249,7 @@ class YTApp(ttkb.Window):
         header.pack(fill=X)
         brand = ttkb.Frame(header)
         brand.pack(side=LEFT)
-        ttkb.Label(brand, text="YT Downloader", font=("Segoe UI Semibold", 16)).pack(side=LEFT)
+        ttkb.Label(brand, text="Media Downloader", font=("Segoe UI Semibold", 16)).pack(side=LEFT)
         ttkb.Label(brand, text="видео · аудио · плейлисты", font=("Segoe UI", 9), bootstyle="secondary").pack(
             side=LEFT, padx=(12, 0), pady=(6, 0)
         )
@@ -836,7 +838,7 @@ class YTApp(ttkb.Window):
         fd, zpath = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
         try:
-            with requests.get(url, stream=True, timeout=600, headers={"User-Agent": "YT-Downloader"}) as r:
+            with requests.get(url, stream=True, timeout=600, headers={"User-Agent": "Media-Downloader"}) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
                 done = 0

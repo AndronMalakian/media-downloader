@@ -17,7 +17,9 @@ ENV/
 *.spec
 
 # Project-local user data / secrets (never commit)
+*.media_downloader_config.json
 *.yt_downloader_config.json
+media_downloader_config.json
 yt_downloader_config.json
 cookies.txt
 cookies*.txt

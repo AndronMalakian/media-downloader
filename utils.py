@@ -170,7 +170,7 @@ def find_ffprobe() -> str | None:
 def get_ffmpeg_download() -> dict | None:
     try:
         url = "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest"
-        r = requests.get(url, timeout=10, headers={"User-Agent": "YT-Downloader"})
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Media-Downloader"})
         r.raise_for_status()
         data = r.json()
         for a in data.get("assets", []):

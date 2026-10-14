@@ -84,7 +84,7 @@ class DownloadProgress:
         self.retry_message = ""
 
 
-class YTDownloader:
+class MediaDownloader:
     def __init__(self, progress_callback: Callable[[DownloadProgress], None] | None = None):
         self.progress_callback = progress_callback
         self.progress = DownloadProgress()
