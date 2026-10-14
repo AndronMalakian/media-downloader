@@ -1,0 +1,193 @@
+<div align="center">
+
+<img src="icon.png" width="96" alt="YT Downloader">
+
+# YT Downloader
+
+**Download YouTube videos, audio and playlists in one click — no ads, no limits, no sign-up.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](#requirements)
+[![Powered by yt-dlp](https://img.shields.io/badge/powered%20by-yt--dlp-red)](https://github.com/yt-dlp/yt-dlp)
+[![Release](https://img.shields.io/github/v/release/TTsanchez/yt-downloader?label=release)](../../releases/latest)
+
+[Download](#-download) · [Features](#-features) · [Usage](#-usage) · [Русский](README.md)
+
+</div>
+
+---
+
+YT Downloader is a simple desktop app for Windows. It runs entirely locally: nothing is sent to third-party servers, there are no ads and no download limits. Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
+
+![Main window](docs/screenshots/01-format.png)
+
+## ✨ Features
+
+- 🎬 **Best quality** — video + audio merged into MP4
+- 🎵 **Audio only** — mp3, m4a, opus, wav with bitrate selection
+- 📼 **Video only** — no sound track
+- 📚 **Playlists** — full or by index range
+- ⚡ **Shorts** and regular videos
+- 📊 **Progress** — percent, speed, ETA, file size
+- ⏹ **Cancel** in-flight downloads
+- 🍪 **Cookies** — for age-restricted and private videos
+- 🔁 **Auto-retry** — up to 3 attempts with different strategies
+- 💾 **Remembers settings** between launches
+- 📦 **Portable `.exe`** — no Python required
+
+## 📥 Download
+
+### Option 1. Ready-made .exe (easiest)
+
+1. Open the [**Releases**](../../releases/latest) page
+2. Download `YT-Downloader.exe`
+3. Run it — no installation needed
+
+> Windows SmartScreen may warn about an unknown publisher because the binary is not code-signed. Click **More info → Run anyway**.
+
+### Option 2. From source
+
+Requires [Python 3.10+](https://www.python.org/downloads/) (check **Add Python to PATH** during install).
+
+```bat
+git clone https://github.com/TTsanchez/yt-downloader.git
+cd yt-downloader
+start.bat
+```
+
+`start.bat` creates the virtual environment, installs dependencies and launches the app.
+
+<details>
+<summary>Manual launch</summary>
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+</details>
+
+## 🚀 Usage
+
+1. **Paste a link** to a video or playlist.
+2. Click **Get info** — title, channel and duration appear.
+3. On the **Format** tab choose what to download: best quality, video only, or audio only.
+4. Click **Download**. Progress and log appear at the bottom.
+5. The file is saved to your download folder (**Open folder** button).
+
+<div align="center">
+<img src="docs/screenshots/03-settings.png" width="49%" alt="Settings">
+<img src="docs/screenshots/02-playlist.png" width="49%" alt="Playlist">
+</div>
+
+## 🧩 Requirements
+
+**FFmpeg is required** for 1080p+ quality and for converting to mp3/m4a/opus.
+
+The app looks for it in:
+- system `PATH`
+- `ffmpeg\ffmpeg.exe`
+- `ffmpeg\bin\ffmpeg.exe` (next to the app)
+
+If not found, use **Download automatically** on the **Settings** tab.
+
+## 🍪 Cookies
+
+Needed when YouTube asks to confirm you're not a bot, and for age-restricted, private or region-locked videos.
+
+**Option 1 — read directly from the browser.** Settings → Cookies → pick a browser.
+
+> **Chrome/Edge 127+ note.** Google switched to app-bound cookie encryption; the key is tied to the browser and cannot be read externally. Close the browser does **not** help. Firefox cookies are readable.
+
+**Option 2 — `cookies.txt` file (always works).**
+1. Install the **Cookie-Editor** extension in your browser
+2. Open youtube.com while signed in
+3. Export cookies in Netscape format (`.txt`)
+4. Settings → Cookies → **Load**
+
+Cookies never leave your machine — they are read locally and used only for requests to YouTube.
+
+## 🧱 YouTube components
+
+Since 2025 YouTube requires a **PO Token** and a **JavaScript challenge**. Without them many videos fail (`The page needs to be reloaded`). The app installs everything itself: **Settings → YouTube components**.
+
+| Component | Purpose | How it installs |
+|---|---|---|
+| **Deno** | Runs YouTube's JS challenge | "Install Deno" button (via winget) |
+| **PO Token server** | Generates access tokens | "Install PO Token" button (needs Node.js and Git) |
+
+The PO Token server is the local Node.js program [bgutil](https://github.com/Brainicism/bgutil-ytdlp-pot-provider). It installs once to `%LOCALAPPDATA%\YT-Downloader\pot` (~165 MB), starts automatically on `127.0.0.1:4416` and stops on exit. Nothing is uploaded.
+
+## 🌐 Network and YouTube blocking (VPN / proxy)
+
+In some countries (e.g. Russia) YouTube is blocked by the ISP **by domain name (SNI/DPI)**: the internet works, `google.com` opens, but YouTube does not. The connection is dropped before encryption, so **no** local downloader can work — it is not a bug in this app.
+
+Check it via **Settings → Network and proxy → Check network**.
+
+- YouTube reachable directly — the app downloads on its own.
+- "domain-name blocking (SNI/DPI)" — you need a **VPN** or **proxy**.
+
+To use a proxy, enter its address in the **Proxy** field (saved to config):
+
+| Example | Description |
+|---|---|
+| `http://host:port` | HTTP/HTTPS proxy |
+| `socks5://host:port` | SOCKS5 proxy |
+| `http://user:pass@host:port` | Proxy with auth |
+
+Empty means a direct connection. The local PO Token server (`127.0.0.1`) always bypasses the proxy.
+
+## 🛠 Troubleshooting
+
+| Message | Cause and fix |
+|---|---|
+| `Connection reset` / `Connection aborted` / TLS timeout | Your network blocks YouTube (SNI/DPI). Use a VPN or proxy |
+| `Failed to decrypt with DPAPI` | Chrome/Edge 127+ cookie protection. Use `cookies.txt` from Cookie-Editor |
+| `Could not copy cookie database` | Browser is open — close it completely |
+| `Sign in to confirm you're not a bot` | Cookies needed. If it persists, your IP may be temporarily blocked by YouTube |
+| `The page needs to be reloaded` | No PO Token — install Deno and PO Token on the Settings tab |
+| `Confirm your age` | Age-restricted — cookies needed |
+| `This video is private` | You need the invite link |
+| `Video unavailable` | Removed or not available in your region |
+
+## ⬆️ Updating
+
+YouTube changes its protections occasionally. When the app stops working, update the engine:
+
+```bat
+py -m pip install -U yt-dlp
+```
+
+If you use the `.exe`, grab a fresh release or rebuild it.
+
+## 👨‍💻 Development
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python main.py
+```
+
+Build a single `.exe` (output in `dist\YT-Downloader.exe`):
+
+```bat
+build_exe.bat
+```
+
+| File | Purpose |
+|---|---|
+| `main.py` | GUI (tkinter + ttkbootstrap) |
+| `downloader.py` | yt-dlp wrapper, formats, retries |
+| `utils.py` | FFmpeg, browsers, cookies, network checks |
+| `pot.py` | PO Token server and Deno installer |
+
+## ⚖️ Legal notice
+
+Downloading content without the rights holder's permission violates YouTube's Terms of Service. Use this app only for material you have the right to: your own videos, Creative Commons, public domain, or content you have explicit permission to use.
+
+## 📄 License
+
+[MIT](LICENSE) © 2026 TTsanchez

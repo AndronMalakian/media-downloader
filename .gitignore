@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# PyInstaller
+*.spec
+
+# Project-local user data / secrets (never commit)
+*.yt_downloader_config.json
+yt_downloader_config.json
+cookies.txt
+cookies*.txt
+*.cookies
+.env
+.env.*
+secrets.*
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

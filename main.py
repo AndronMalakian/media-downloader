@@ -1,0 +1,1163 @@
+import json
+import os
+import sys
+import threading
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import ttkbootstrap as ttkb
+from ttkbootstrap.constants import BOTH, BOTTOM, HORIZONTAL, LEFT, RIGHT, VERTICAL, X, Y
+
+try:
+    from ttkbootstrap.tooltip import ToolTip
+except ImportError:
+    from ttkbootstrap import ToolTip
+
+
+def add_tooltip(widget, text: str, **kwargs):
+    try:
+        return ToolTip(widget, text=text, **kwargs)
+    except TypeError:
+        return ToolTip(widget, text, **kwargs)
+
+
+def resource_path(name: str) -> str:
+    """Путь к ресурсу и в режиме исходников, и внутри собранного .exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+from downloader import DownloadProgress, YTDownloader
+from pot import (
+    SERVER_HOST,
+    SERVER_PORT,
+    find_deno,
+    install_provider,
+    provider_installed,
+    server_running,
+    start_server,
+    stop_server,
+)
+import pot
+from utils import (
+    browser_reads_ok,
+    check_cookies_file,
+    check_youtube_network,
+    detect_browsers,
+    find_ffmpeg,
+    find_ffprobe,
+    format_bytes,
+    format_duration,
+    format_eta,
+    get_default_download_dir,
+    get_ffmpeg_download,
+    is_browser_running,
+)
+
+CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
+FFMPEG_URL = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest"
+
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _run_process(cmd, cwd=None, timeout=1800):
+    """Запускает команду и возвращает (код возврата, вывод)."""
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 1, f"Таймаут после {timeout} с"
+    except Exception as e:
+        return 1, str(e)
+
+
+class VScroll(ttkb.Frame):
+    """Фрейм с вертикальной прокруткой (колесо мыши + полоса справа)."""
+
+    def __init__(self, master, height=250, bg=None, **kw):
+        super().__init__(master, **kw)
+        self.canvas = tk.Canvas(self, height=height, highlightthickness=0, bd=0, takefocus=0)
+        if bg:
+            self.canvas.configure(bg=bg)
+        self.canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        sb = ttkb.Scrollbar(self, orient=VERTICAL, command=self.canvas.yview, bootstyle="round")
+        sb.pack(side=RIGHT, fill=Y)
+        self.canvas.configure(yscrollcommand=sb.set)
+
+        self.inner = ttkb.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
+    def _on_inner(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas(self, event):
+        self.canvas.itemconfigure(self._win, width=event.width)
+
+    def _on_wheel(self, event):
+        # Крутим только если курсор внутри этой области (иначе не мешаем журналу)
+        node = event.widget
+        while node is not None:
+            if node is self.canvas:
+                self.canvas.yview_scroll(int(-event.delta / 120), "units")
+                return
+            node = getattr(node, "master", None)
+
+
+class YTApp(ttkb.Window):
+    def __init__(self):
+        super().__init__(title="YT Downloader", size=(960, 720), minsize=(880, 580))
+        self._fit_to_screen()
+        try:
+            ico = resource_path("icon.ico")
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+        self._set_theme()
+        self.downloader = YTDownloader(progress_callback=self.on_progress)
+        self.cookies_path: str | None = None
+        self.is_downloading = False
+        self.config = self._load_config()
+
+        self._init_vars()
+        self._build_ui()
+        self._apply_config()
+        self._check_ffmpeg()
+        self._refresh_browser_list()
+        saved = getattr(self, "_saved_browser", "без cookies")
+        if saved and saved != "без cookies" and browser_reads_ok(saved):
+            for label, key in self._browser_by_label.items():
+                    if key == saved:
+                        self.cmb_browser.set(label)
+                        break
+        self._refresh_browser_status()
+        self._check_components()
+        threading.Thread(target=self._autostart_pot, daemon=True).start()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._log("Готово. Вставьте ссылку с YouTube и нажмите «Получить информацию»")
+
+    def _fit_to_screen(self):
+        """Подгоняет окно под экран, чтобы нижние кнопки не уезжали за край."""
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            return
+        w = min(980, max(880, sw - 60))
+        h = min(720, max(560, sh - 90))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 3)
+        self.minsize(880, min(650, h))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _set_theme(self):
+        for name in ("bootstrap-dark", "darkly", "cyborg", "superhero"):
+            try:
+                self.style.theme_use(name)
+                return
+            except Exception:
+                continue
+
+    # ---------- config ----------
+
+    def _load_config(self) -> dict:
+        try:
+            if CONFIG_FILE.exists():
+                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_config(self):
+        try:
+            data = {
+                "output_dir": self.output_dir_var.get(),
+                "audio_format": self.audio_format_var.get(),
+                "audio_quality": self.audio_quality_var.get(),
+                "restrict_filenames": self.restrict_names_var.get(),
+                "browser": self._active_browser() or "без cookies",
+                "cookies_file": self.cookies_path or "",
+                "proxy": self.proxy_var.get().strip(),
+            }
+            CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _apply_config(self):
+        self.output_dir_var.set(self.config.get("output_dir", str(get_default_download_dir())))
+        self.audio_format_var.set(self.config.get("audio_format", "mp3"))
+        self.audio_quality_var.set(self.config.get("audio_quality", "192"))
+        self.restrict_names_var.set(self.config.get("restrict_filenames", True))
+        self._saved_browser = self.config.get("browser", "без cookies")
+        self.proxy_var.set(self.config.get("proxy", ""))
+
+        # Восстанавливаем cookies.txt: без него YouTube отдаёт максимум 360p
+        saved_cookies = self.config.get("cookies_file", "")
+        if saved_cookies and Path(saved_cookies).is_file():
+            self.cookies_path = saved_cookies
+            self._apply_cookie_status(saved_cookies)
+        else:
+            self.cookies_path = None
+
+    def _init_vars(self):
+        v = tk.StringVar
+        self.url_var = v()
+        self.output_dir_var = v()
+        self.format_var = v(value="best")
+        self.audio_format_var = v(value="mp3")
+        self.audio_quality_var = v(value="192")
+        self.restrict_names_var = tk.BooleanVar(value=True)
+        self.browser_var = v(value="без cookies")
+        self.proxy_var = v()
+        self._browser_by_label: dict[str, str | None] = {"без cookies": None}
+        self._detected: list[tuple[str, str]] = []
+        self.playlist_all_var = tk.BooleanVar(value=True)
+        self.playlist_start_var = tk.IntVar(value=1)
+        self.playlist_end_var = tk.IntVar(value=0)
+        self.status_var = v(value="Готов к работе")
+        self.speed_var = v(value="—")
+        self.eta_var = v(value="—")
+        self.size_var = v(value="—")
+
+    # ---------- ui ----------
+
+    def _build_ui(self):
+        try:
+            bg = self.style.lookup("TFrame", "background") or "#2b3035"
+        except Exception:
+            bg = "#2b3035"
+
+        header = ttkb.Frame(self, padding=(20, 10, 20, 8))
+        header.pack(fill=X)
+        brand = ttkb.Frame(header)
+        brand.pack(side=LEFT)
+        ttkb.Label(brand, text="YT Downloader", font=("Segoe UI Semibold", 16)).pack(side=LEFT)
+        ttkb.Label(brand, text="видео · аудио · плейлисты", font=("Segoe UI", 9), bootstyle="secondary").pack(
+            side=LEFT, padx=(12, 0), pady=(6, 0)
+        )
+        self.ffmpeg_badge = ttkb.Label(header, text="FFmpeg: проверка...", font=("Segoe UI", 8), bootstyle="warning")
+        self.ffmpeg_badge.pack(side=RIGHT)
+
+        ttkb.Separator(self).pack(fill=X, padx=20)
+
+        url_box = ttkb.LabelFrame(self, text=" Ссылка ", padding=(14, 10, 14, 10))
+        url_box.pack(fill=X, padx=20, pady=(10, 8))
+        row = ttkb.Frame(url_box)
+        row.pack(fill=X)
+        self.url_entry = ttkb.Entry(row, textvariable=self.url_var, font=("Segoe UI", 10))
+        self.url_entry.pack(side=LEFT, fill=X, expand=True, ipady=4)
+        self.url_entry.bind("<Return>", lambda e: self._get_info_async())
+        ttkb.Button(row, text="Вставить", width=10, bootstyle="light-outline", command=self._paste_url).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(row, text="Очистить", width=10, bootstyle="light-outline", command=self._clear_url).pack(side=LEFT, padx=(6, 0))
+        ttkb.Button(row, text="Получить информацию", width=20, bootstyle="primary", command=self._get_info_async).pack(side=LEFT, padx=(6, 0))
+
+        self.title_lbl = ttkb.Label(url_box, text="Название: —", font=("Segoe UI", 9, "bold"), wraplength=860, justify=LEFT)
+        self.title_lbl.pack(anchor="w", fill=X, pady=(10, 0))
+        self.meta_lbl = ttkb.Label(url_box, text="Длительность: —    Канал: —", font=("Segoe UI", 8), bootstyle="secondary", wraplength=860, justify=LEFT)
+        self.meta_lbl.pack(anchor="w", fill=X, pady=(2, 0))
+
+        nb = ttkb.Notebook(self, padding=(0, 2))
+        nb.pack(fill=X, padx=20)
+
+        tab_fmt = ttkb.Frame(nb, padding=(16, 8, 16, 8))
+        nb.add(tab_fmt, text="Формат")
+        fbox = ttkb.LabelFrame(tab_fmt, text=" Что скачивать ", padding=(14, 8, 14, 8))
+        fbox.pack(fill=X)
+        self.rb_best = ttkb.Radiobutton(fbox, text="Лучшее качество — видео + аудио (MP4)", variable=self.format_var, value="best", command=self._update_state)
+        self.rb_best.pack(anchor="w", pady=1)
+        add_tooltip(self.rb_best, "Скачает лучшее доступное видео и лучшую дорожку звука, затем склеит в один MP4")
+        self.rb_video = ttkb.Radiobutton(fbox, text="Только видео (без звука)", variable=self.format_var, value="bestvideo", command=self._update_state)
+        self.rb_video.pack(anchor="w", pady=1)
+        self.rb_audio = ttkb.Radiobutton(fbox, text="Только аудио", variable=self.format_var, value="bestaudio", command=self._update_state)
+        self.rb_audio.pack(anchor="w", pady=1)
+
+        self.audio_box = ttkb.LabelFrame(tab_fmt, text=" Настройки аудио ", padding=(14, 6, 14, 6))
+        self.audio_box.pack(fill=X, pady=(6, 0))
+        arow = ttkb.Frame(self.audio_box)
+        arow.pack(fill=X)
+        ttkb.Label(arow, text="Формат:", width=10).pack(side=LEFT)
+        self.cmb_af = ttkb.Combobox(arow, values=["mp3", "m4a", "opus", "wav"], textvariable=self.audio_format_var, state="readonly", width=10)
+        self.cmb_af.pack(side=LEFT, padx=(5, 0))
+        self.cmb_af.bind("<<ComboboxSelected>>", lambda e: self._save_config())
+        ttkb.Label(arow, text="Битрейт:", width=12).pack(side=LEFT, padx=(18, 0))
+        self.cmb_aq = ttkb.Combobox(arow, values=["128", "160", "192", "256", "320"], textvariable=self.audio_quality_var, state="readonly", width=8)
+        self.cmb_aq.pack(side=LEFT, padx=(5, 0))
+        self.cmb_aq.bind("<<ComboboxSelected>>", lambda e: self._save_config())
+        ttkb.Label(arow, text="kbps", bootstyle="secondary", font=("Segoe UI", 8)).pack(side=LEFT, padx=(6, 0))
+        ttkb.Label(self.audio_box, text="mp3 — универсальный · m4a — Apple · opus — лучшее сжатие · wav — без потерь", bootstyle="secondary", font=("Segoe UI", 8)).pack(
+            anchor="w", pady=(6, 0)
+        )
+
+        tab_pl = ttkb.Frame(nb, padding=(16, 8, 16, 8))
+        nb.add(tab_pl, text="Плейлист")
+        pbox = ttkb.LabelFrame(tab_pl, text=" Диапазон ", padding=(14, 8, 14, 8))
+        pbox.pack(fill=X)
+        ttkb.Radiobutton(pbox, text="Весь плейлист", variable=self.playlist_all_var, value=True, command=self._update_state).pack(anchor="w", pady=1)
+        ttkb.Radiobutton(pbox, text="Только выбранные видео", variable=self.playlist_all_var, value=False, command=self._update_state).pack(anchor="w", pady=1)
+        prow = ttkb.Frame(pbox)
+        prow.pack(fill=X, pady=(6, 0))
+        ttkb.Label(prow, text="С номера:", width=12).pack(side=LEFT)
+        self.sp_start = ttkb.Spinbox(prow, from_=1, to=99999, textvariable=self.playlist_start_var, width=9, state="disabled")
+        self.sp_start.pack(side=LEFT, padx=(5, 0))
+        ttkb.Label(prow, text="по номер:", width=11).pack(side=LEFT, padx=(14, 0))
+        self.sp_end = ttkb.Spinbox(prow, from_=0, to=99999, textvariable=self.playlist_end_var, width=9, state="disabled")
+        self.sp_end.pack(side=LEFT, padx=(5, 0))
+        ttkb.Label(prow, text="(0 — до конца)", bootstyle="secondary", font=("Segoe UI", 8)).pack(side=LEFT, padx=(6, 0))
+        ttkb.Label(tab_pl, text="Для одиночного видео эти настройки игнорируются.", bootstyle="secondary", font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 0))
+
+        tab_set = ttkb.Frame(nb)
+        nb.add(tab_set, text="Настройки")
+        _settings_scroll = VScroll(tab_set, height=150, bg=bg)
+        _settings_scroll.pack(fill=BOTH, expand=True)
+        tab_set = ttkb.Frame(_settings_scroll.inner, padding=(14, 10, 14, 10))
+        tab_set.pack(fill=BOTH, expand=True)
+
+        obox = ttkb.LabelFrame(tab_set, text="Папка сохранения", padding=(14, 10, 14, 10))
+        obox.pack(fill=X)
+        orow = ttkb.Frame(obox)
+        orow.pack(fill=X)
+        ttkb.Entry(orow, textvariable=self.output_dir_var).pack(side=LEFT, fill=X, expand=True, ipady=3)
+        ttkb.Button(orow, text="Обзор...", width=11, bootstyle="light-outline", command=self._browse_dir).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(orow, text="Открыть", width=11, bootstyle="light-outline", command=self._open_dir).pack(side=LEFT, padx=(6, 0))
+
+        nbox = ttkb.LabelFrame(tab_set, text="Имена файлов", padding=(14, 10, 14, 10))
+        nbox.pack(fill=X, pady=(10, 0))
+        ttkb.Checkbutton(
+            nbox,
+            text="Ограничить недопустимые символы (рекомендуется)",
+            variable=self.restrict_names_var,
+            command=self._save_config,
+        ).pack(anchor="w")
+
+        cbox = ttkb.LabelFrame(tab_set, text="Cookies — для возрастных и приватных видео", padding=(14, 10, 14, 10))
+        cbox.pack(fill=X, pady=(10, 0))
+        crow = ttkb.Frame(cbox)
+        crow.pack(fill=X)
+        self.cookie_lbl = ttkb.Label(crow, text="Cookies не загружены", bootstyle="secondary")
+        self.cookie_lbl.pack(side=LEFT, fill=X, expand=True)
+        ttkb.Button(crow, text="Загрузить", width=12, bootstyle="light-outline", command=self._load_cookies).pack(side=LEFT, padx=(6, 0))
+        ttkb.Button(crow, text="Удалить", width=12, bootstyle="light-outline", command=self._clear_cookies).pack(side=LEFT, padx=(6, 0))
+        ttkb.Label(
+            cbox,
+            text="Формат Netscape (.txt). Экспортируется расширениями Cookie-Editor или «Get cookies.txt LOCALLY». Файл хранится только на этом компьютере.",
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(8, 0))
+
+        bbox = ttkb.LabelFrame(cbox, text="Или взять cookies прямо из браузера", padding=(14, 10, 14, 10))
+        bbox.pack(fill=X, pady=(10, 0))
+        brow = ttkb.Frame(bbox)
+        brow.pack(fill=X)
+        ttkb.Label(brow, text="Браузер:", width=12).pack(side=LEFT)
+        self.cmb_browser = ttkb.Combobox(
+            brow,
+            values=["без cookies"],
+            textvariable=self.browser_var,
+            state="readonly",
+            width=16,
+        )
+        self.cmb_browser.pack(side=LEFT, padx=(5, 0))
+        self.cmb_browser.bind("<<ComboboxSelected>>", lambda e: self._refresh_browser_status())
+        ttkb.Button(brow, text="Обновить", width=12, bootstyle="light-outline", command=self._refresh_browser_list).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(brow, text="Сбросить", width=12, bootstyle="light-outline", command=self._reset_browser).pack(side=LEFT, padx=(6, 0))
+        self.browser_status = ttkb.Label(
+            bbox,
+            text="",
+            bootstyle="warning",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        )
+        self.browser_status.pack(anchor="w", pady=(8, 0))
+        ttkb.Label(
+            bbox,
+            text="Важно: браузер должен быть ПОЛНОСТЬЮ закрыт, иначе файл cookies заблокирован и будет ошибка «Could not copy cookie database».",
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(6, 0))
+
+        fbox2 = ttkb.LabelFrame(tab_set, text="FFmpeg", padding=(14, 10, 14, 10))
+        fbox2.pack(fill=X, pady=(10, 0))
+        self.ffmpeg_lbl = ttkb.Label(fbox2, text="FFmpeg: проверка...", wraplength=820, justify=LEFT)
+        self.ffmpeg_lbl.pack(anchor="w")
+        frow = ttkb.Frame(fbox2)
+        frow.pack(fill=X, pady=(8, 0))
+        ttkb.Button(frow, text="Проверить", width=13, bootstyle="light-outline", command=self._check_ffmpeg).pack(side=LEFT)
+        ttkb.Button(frow, text="Скачать автоматически", width=24, bootstyle="light-outline", command=self._download_ffmpeg_async).pack(side=LEFT, padx=(8, 0))
+        ttkb.Label(
+            fbox2,
+            text="Обязателен для склейки видео+аудио (1080p и выше) и конвертации в MP3/M4A/Opus.",
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(8, 0))
+
+        kbox = ttkb.LabelFrame(tab_set, text="Компоненты для работы с YouTube", padding=(14, 10, 14, 10))
+        kbox.pack(fill=X, pady=(10, 0))
+        self.deno_lbl = ttkb.Label(kbox, text="Deno: проверка...", wraplength=820, justify=LEFT)
+        self.deno_lbl.pack(anchor="w")
+        self.pot_lbl = ttkb.Label(kbox, text="PO Token: проверка...", wraplength=820, justify=LEFT)
+        self.pot_lbl.pack(anchor="w", pady=(4, 0))
+        krow = ttkb.Frame(kbox)
+        krow.pack(fill=X, pady=(8, 0))
+        ttkb.Button(krow, text="Проверить", width=13, bootstyle="light-outline", command=self._check_components).pack(side=LEFT)
+        ttkb.Button(krow, text="Установить Deno", width=20, bootstyle="light-outline", command=self._install_deno_async).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(krow, text="Установить PO Token", width=24, bootstyle="light-outline", command=self._install_pot_async).pack(side=LEFT, padx=(8, 0))
+        ttkb.Label(
+            kbox,
+            text=(
+                "YouTube требует PO Token и JavaScript-челлендж. Без них — ошибка «The page needs to be reloaded».\n"
+                "Deno ставится через winget. PO Token — локальный Node.js-сервер (~165 МБ, ставится один раз, нужен Node.js и Git).\n"
+                "Нужны только для защищённых видео; для открытых часто работает и без них."
+            ),
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(8, 0))
+
+        netbox = ttkb.LabelFrame(tab_set, text="Сеть и прокси — обход блокировки YouTube", padding=(14, 10, 14, 10))
+        netbox.pack(fill=X, pady=(10, 0))
+        nrow = ttkb.Frame(netbox)
+        nrow.pack(fill=X)
+        ttkb.Label(nrow, text="Прокси:", width=10).pack(side=LEFT)
+        ttkb.Entry(nrow, textvariable=self.proxy_var, font=("Segoe UI", 9)).pack(side=LEFT, fill=X, expand=True, ipady=3)
+        ttkb.Button(nrow, text="Проверить сеть", width=16, bootstyle="light-outline", command=self._check_network_async).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttkb.Button(nrow, text="Сохранить", width=12, bootstyle="light-outline", command=self._save_config).pack(
+            side=LEFT, padx=(6, 0)
+        )
+        self.net_lbl = ttkb.Label(
+            netbox,
+            text="Нажмите «Проверить сеть», чтобы узнать, доступен ли YouTube напрямую.",
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        )
+        self.net_lbl.pack(anchor="w", pady=(8, 0))
+        ttkb.Label(
+            netbox,
+            text=(
+                "В России YouTube часто блокируется по имени домена (SNI/DPI): сайт не открывается, хотя интернет работает.\n"
+                "Программа в этом случае качать не сможет — ни один локальный загрузчик не сможет. Помогает VPN или прокси.\n"
+                "Формат прокси: http://хост:порт, socks5://хост:порт или http://логин:пароль@хост:порт. Пусто — прямое подключение."
+            ),
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(6, 0))
+
+        pbox2 = ttkb.LabelFrame(self, text=" Прогресс ", padding=(16, 8, 16, 8))
+        pbox2.pack(fill=X, padx=20, pady=(8, 0))
+        self.progress_bar = ttkb.Progressbar(pbox2, orient=HORIZONTAL, mode="determinate", maximum=100, value=0)
+        self.progress_bar.pack(fill=X)
+        irow = ttkb.Frame(pbox2)
+        irow.pack(fill=X, pady=(7, 0))
+        self.percent_lbl = ttkb.Label(irow, text="0%", font=("Segoe UI", 9, "bold"), width=6)
+        self.percent_lbl.pack(side=LEFT)
+        ttkb.Label(irow, textvariable=self.speed_var, bootstyle="secondary", font=("Segoe UI", 8)).pack(side=LEFT, padx=(10, 0))
+        ttkb.Label(irow, textvariable=self.eta_var, bootstyle="secondary", font=("Segoe UI", 8)).pack(side=LEFT, padx=(10, 0))
+        ttkb.Label(irow, textvariable=self.size_var, bootstyle="secondary", font=("Segoe UI", 8)).pack(side=LEFT, padx=(10, 0))
+        self.fname_lbl = ttkb.Label(irow, text="—", bootstyle="secondary", font=("Segoe UI", 8), wraplength=380, justify=RIGHT)
+        self.fname_lbl.pack(side=RIGHT, fill=X, expand=True)
+        self.status_lbl = ttkb.Label(pbox2, textvariable=self.status_var, bootstyle="info")
+        self.status_lbl.pack(anchor="w", pady=(6, 0))
+
+        # Нижняя панель цепляется к низу окна и никогда не уезжает за экран
+        arow2 = ttkb.Frame(self, padding=(20, 8, 20, 12))
+        arow2.pack(side=BOTTOM, fill=X)
+        self.btn_download = ttkb.Button(arow2, text="Скачать", width=16, bootstyle="success", command=self._download_async)
+        self.btn_download.pack(side=LEFT)
+        self.btn_stop = ttkb.Button(arow2, text="Остановить", width=16, bootstyle="danger", command=self._stop_download, state="disabled")
+        self.btn_stop.pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(arow2, text="Очистить лог", width=14, bootstyle="light-outline", command=self._clear_log).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(arow2, text="Папка загрузок", bootstyle="light-outline", command=self._open_dir).pack(side=LEFT, padx=(8, 0))
+        ttkb.Label(arow2, text="обновить yt-dlp:  py -m yt_dlp -U", bootstyle="secondary", font=("Segoe UI", 8)).pack(
+            side=RIGHT, padx=(10, 0)
+        )
+
+        lbox = ttkb.LabelFrame(self, text=" Журнал ", padding=(12, 8, 12, 8))
+        lbox.pack(fill=BOTH, expand=True, padx=20, pady=(10, 10))
+        self.log_text = tk.Text(lbox, height=6, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", borderwidth=0, padx=10, pady=8, relief="flat")
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        sb = ttkb.Scrollbar(lbox, orient=VERTICAL, command=self.log_text.yview)
+        sb.pack(side=RIGHT, fill=Y)
+        self.log_text.configure(yscrollcommand=sb.set, state="disabled")
+
+        self._update_state()
+
+    def _update_state(self):
+        state = "disabled" if self.playlist_all_var.get() else "normal"
+        self.sp_start.configure(state=state)
+        self.sp_end.configure(state=state)
+        self._save_config()
+
+    # ---------- log ----------
+
+    def _log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
+    # ---------- actions ----------
+
+    def _paste_url(self):
+        try:
+            text = self.clipboard_get().strip()
+        except Exception:
+            self._log("Буфер обмена пуст")
+            return
+        if text:
+            self.url_var.set(text)
+            self._log(f"Ссылка вставлена: {text[:70]}")
+
+    def _clear_url(self):
+        self.url_var.set("")
+        self.title_lbl.config(text="Название: —")
+        self.meta_lbl.config(text="Длительность: — | Канал: —")
+        self.status_var.set("Готов к работе")
+        self.progress_bar["value"] = 0
+        self.percent_lbl.config(text="0%")
+        self.speed_var.set("—")
+        self.eta_var.set("—")
+        self.size_var.set("—")
+        self.fname_lbl.config(text="—")
+        self._log("Ссылка очищена")
+
+    def _browse_dir(self):
+        chosen = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(get_default_download_dir()))
+        if chosen:
+            self.output_dir_var.set(chosen)
+            self._save_config()
+            self._log(f"Папка сохранения: {chosen}")
+
+    def _open_dir(self):
+        p = Path(self.output_dir_var.get() or str(get_default_download_dir()))
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(p))
+            elif sys.platform == "darwin":
+                os.system(f'open "{p}"')
+            else:
+                os.system(f'xdg-open "{p}"')
+            self._log(f"Открыта папка: {p}")
+        except Exception as e:
+            self._log(f"Не удалось открыть папку: {e}")
+
+    def _load_cookies(self):
+        chosen = filedialog.askopenfilename(title="Выберите cookies.txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if chosen:
+            self.cookies_path = chosen
+            self._log(f"Cookies загружены: {chosen}")
+            self._apply_cookie_status(chosen)
+            self._save_config()
+
+    def _apply_cookie_status(self, path):
+        """Показывает, есть ли в cookies данные входа (SID/LOGIN_INFO)."""
+        res = check_cookies_file(path)
+        name = Path(path).name
+        if res.get("authenticated"):
+            self.cookie_lbl.config(text=f"Загружены: {name} — вход подтверждён", bootstyle="success")
+        elif res.get("ok"):
+            self.cookie_lbl.config(text=f"Загружены: {name} — БЕЗ входа в аккаунт", bootstyle="warning")
+            self._log(res.get("detail", ""))
+        else:
+            self.cookie_lbl.config(text=f"Загружены: {name} (не удалось проверить)", bootstyle="warning")
+
+    def _clear_cookies(self):
+        self.cookies_path = None
+        self.cookie_lbl.config(text="Cookies не загружены", bootstyle="secondary")
+        self._log("Cookies удалены")
+        self._save_config()
+
+    def _reset_browser(self):
+        self.browser_var.set("без cookies")
+        self._refresh_browser_status()
+        self._save_config()
+
+    def _active_browser(self) -> str | None:
+        value = self.browser_var.get()
+        if not value or value == "без cookies":
+            return None
+        return value
+
+    def _refresh_browser_list(self):
+        self._detected = detect_browsers()
+        self._browser_by_label = {"без cookies": None}
+        labels = ["без cookies"]
+        for name, _profile in self._detected:
+            if browser_reads_ok(name):
+                label = name
+            else:
+                label = f"{name} — нельзя (защита 127+)"
+            self._browser_by_label[label] = name
+            labels.append(label)
+
+        self.cmb_browser.configure(values=labels)
+        current = self.browser_var.get()
+        if current in self._browser_by_label:
+            self.cmb_browser.set(current)
+        else:
+            self.browser_var.set("без cookies")
+        self._refresh_browser_status()
+
+        usable = [n for n, _ in self._detected if browser_reads_ok(n)]
+        if usable:
+            self._log(f"Браузеры, из которых можно читать cookies: {', '.join(usable)}")
+        else:
+            self._log("Ни один браузер нельзя читать напрямую (защита 127+) — нужен cookies.txt")
+
+    def _active_browser(self) -> str | None:
+        return self._browser_by_label.get(self.browser_var.get())
+
+    def _refresh_browser_status(self):
+        label = self.browser_var.get()
+        browser = self._active_browser()
+        blocked = [n for n, _ in self._detected if not browser_reads_ok(n)]
+
+        if browser and not browser_reads_ok(browser):
+            self.browser_status.config(
+                text=(
+                    f"{browser} использует защиту cookies 127+ — читать их напрямую нельзя, "
+                    "закрытие браузера не поможет. Экспортируйте cookies.txt расширением Cookie-Editor."
+                ),
+                bootstyle="danger",
+            )
+            return
+
+        if not browser:
+            if blocked:
+                self.browser_status.config(
+                    text=(
+                        f"Cookies напрямую недоступны: {', '.join(blocked)} используют защиту 127+. "
+                        "Нужен cookies.txt из расширения Cookie-Editor."
+                    ),
+                    bootstyle="warning",
+                )
+            else:
+                self.browser_status.config(text="Cookies из браузера не используются.", bootstyle="secondary")
+            return
+
+        if is_browser_running([browser]):
+            self.browser_status.config(
+                text=f"{browser} сейчас открыт — закройте его полностью.",
+                bootstyle="warning",
+            )
+        else:
+            self.browser_status.config(text=f"{browser} закрыт, можно читать cookies.", bootstyle="success")
+
+
+    def _check_browsers_before_download(self) -> bool:
+        browser = self._active_browser()
+        if not browser:
+            return True
+        if not browser_reads_ok(browser):
+            if not messagebox.askokcancel(
+                "Браузер недоступен",
+                f"{browser} использует защиту 127+ — cookies из него прочитать нельзя.\n\n"
+                "Вместо этого экспортируйте cookies.txt расширением Cookie-Editor и загрузите его "
+                "в «Настройки» → Cookies.\n\n"
+                "Продолжить без cookies?",
+            ):
+                return False
+            return True
+        if is_browser_running([browser]):
+            if not messagebox.askyesno(
+                "Браузер открыт",
+                f"{browser} сейчас запущен. Cookies не удастся прочитать, пока он открыт.\n\n"
+                "Закрыть браузер и продолжить?",
+            ):
+                return False
+        return True
+
+    def _check_ffmpeg(self):
+        ffmpeg = find_ffmpeg()
+        ffprobe = find_ffprobe()
+        if ffmpeg and ffprobe:
+            self.ffmpeg_badge.config(text="FFmpeg: найден", bootstyle="success")
+            self.ffmpeg_lbl.config(text=f"FFmpeg найден: {ffmpeg}", bootstyle="success")
+            self._log(f"FFmpeg найден: {ffmpeg}")
+        elif ffmpeg:
+            self.ffmpeg_badge.config(text="FFmpeg: неполный", bootstyle="warning")
+            self.ffmpeg_lbl.config(
+                text=f"Найден только ffmpeg ({ffmpeg}), нет ffprobe. Склейка видео+аудио работать не будет — нажмите «Скачать автоматически».",
+                bootstyle="warning",
+            )
+            self._log("FFmpeg найден, но нет ffprobe — склейка видео не сработает")
+        else:
+            self.ffmpeg_badge.config(text="FFmpeg: не найден", bootstyle="danger")
+            self.ffmpeg_lbl.config(text="FFmpeg не найден. Ищите в PATH или в папке ffmpeg/bin/ffmpeg.exe", bootstyle="danger")
+            self._log("FFmpeg не найден — качества 1080p+ и MP3 могут не работать")
+
+    def _check_components(self):
+        deno = find_deno()
+        if deno:
+            self.deno_lbl.config(text=f"Deno: найден ({deno})", bootstyle="success")
+        else:
+            self.deno_lbl.config(
+                text="Deno: не найден — нужен для решения проверок YouTube. Нажмите «Установить Deno».",
+                bootstyle="danger",
+            )
+
+        if server_running():
+            self.pot_lbl.config(text=f"PO Token сервер: запущен ({SERVER_HOST}:{SERVER_PORT})", bootstyle="success")
+        elif provider_installed():
+            self.pot_lbl.config(text="PO Token сервер: установлен, но не запущен. Запустится автоматически.", bootstyle="warning")
+        else:
+            self.pot_lbl.config(
+                text="PO Token сервер: не установлен. Нажмите «Установить PO Token».",
+                bootstyle="danger",
+            )
+
+    def _check_network_async(self):
+        self.net_lbl.config(text="Проверяю доступ к YouTube...", bootstyle="secondary")
+        threading.Thread(target=self._check_network, daemon=True).start()
+
+    def _check_network(self):
+        try:
+            res = check_youtube_network()
+        except Exception as e:
+            self.after(0, lambda: self.net_lbl.config(text=f"Ошибка проверки: {e}", bootstyle="danger"))
+            return
+        state = res.get("state")
+        detail = res.get("detail", "")
+        style = {"ok": "success", "blocked": "danger"}.get(state, "warning")
+        self.after(0, lambda: self.net_lbl.config(text=detail, bootstyle=style))
+
+    def _autostart_pot(self):
+        """Тихо поднимает PO Token сервер, если провайдер уже установлен."""
+        if not provider_installed() or server_running():
+            return
+        self.after(0, lambda: self._log("Запускаю PO Token сервер..."))
+        if start_server(log=lambda m: self.after(0, lambda msg=m: self._log(msg))):
+            self.after(0, self._check_components)
+
+    def _ensure_pot_server(self) -> bool:
+        if server_running():
+            return True
+        if not provider_installed():
+            return False
+        ok = start_server(log=lambda m: self._log(m))
+        self._check_components()
+        return ok
+
+    def _install_deno_async(self):
+        def work():
+            self._log("Устанавливаю Deno через winget...")
+            code, _ = _run_process(
+                ["winget", "install", "--id", "DenoLand.Deno", "--exact", "--silent",
+                 "--accept-package-agreements", "--accept-source-agreements"],
+                timeout=900,
+            )
+            if code == 0:
+                self._log("Deno установлен.")
+            else:
+                self._log("winget не смог поставить Deno. Скачайте вручную: https://deno.com")
+            self.after(0, self._check_components)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_pot_async(self):
+        def work():
+            self._log("Устанавливаю PO Token провайдер, это займёт несколько минут...")
+            ok, msg = install_provider(log=lambda m: self._log(m))
+            if ok:
+                self._log(f"Провайдер установлен: {msg}")
+                self._log("Запускаю сервер...")
+                if start_server(log=lambda m: self._log(m)):
+                    self._log("Готово — PO Token работает.")
+                else:
+                    self._log("Сервер не поднялся, проверьте журнал.")
+                self.after(0, lambda: messagebox.showinfo("PO Token", "PO Token провайдер установлен и запущен."))
+            else:
+                self._log(f"Ошибка установки: {msg}")
+                self.after(0, lambda: messagebox.showerror("PO Token", f"Не удалось установить:\n\n{msg}"))
+            self.after(0, self._check_components)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _download_ffmpeg_async(self):
+        threading.Thread(target=self._download_ffmpeg, daemon=True).start()
+
+    @staticmethod
+    def _ffmpeg_root() -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "ffmpeg"
+        return Path.cwd() / "ffmpeg"
+
+    def _download_ffmpeg(self):
+        self._log("Ищу последнюю сборку FFmpeg...")
+        info = get_ffmpeg_download()
+        if not info:
+            self._log("Не удалось получить ссылку на FFmpeg — открываю страницу вручную")
+            messagebox.showwarning("FFmpeg", f"Автозагрузка не удалась.\n\nСкачайте «essentials build win64» со страницы:\n{FFMPEG_URL}\n\nЗатем распакуйте ffmpeg.exe в папку ffmpeg/bin/ рядом с программой.")
+            import webbrowser
+
+            webbrowser.open(FFMPEG_URL)
+            return
+
+        import shutil
+        import tempfile
+
+        import requests
+
+        url = info["url"]
+        self._log(f"Найдено: {info['name']} ({format_bytes(info['size'])})")
+        fd, zpath = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            with requests.get(url, stream=True, timeout=600, headers={"User-Agent": "YT-Downloader"}) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                done = 0
+                with open(zpath, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        if chunk:
+                            f.write(chunk)
+                            done += len(chunk)
+                            if total:
+                                self._log(f"Загружено FFmpeg: {int(done / total * 100)}%")
+
+            self._log("Распаковываю...")
+            ffmpeg_dir = self._ffmpeg_root()
+            with zipfile.ZipFile(zpath) as z:
+                z.extractall(ffmpeg_dir)
+
+            extracted = {}
+            for root, _dirs, files in os.walk(ffmpeg_dir):
+                for name in files:
+                    if name in ("ffmpeg.exe", "ffprobe.exe"):
+                        extracted[name] = Path(root) / name
+
+            if "ffmpeg.exe" not in extracted:
+                raise RuntimeError("ffmpeg.exe не найден после распаковки")
+
+            target_dir = ffmpeg_dir / "bin"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for name, source in extracted.items():
+                target = target_dir / name
+                if source.resolve() == target.resolve():
+                    continue
+                try:
+                    os.replace(source, target)
+                except OSError:
+                    shutil.move(str(source), str(target))
+
+            missing = [n for n in ("ffmpeg.exe", "ffprobe.exe") if n not in extracted]
+            self._log(f"FFmpeg установлен в {target_dir}")
+            if missing:
+                self._log(f"Внимание: не найден {', '.join(missing)} — склейка видео может не работать")
+            messagebox.showinfo("FFmpeg", f"FFmpeg скачан и установлен.\n\n{target_dir}")
+        except Exception as e:
+            self._log(f"Ошибка загрузки FFmpeg: {e}")
+            messagebox.showerror("FFmpeg", f"Не удалось скачать FFmpeg:\n{e}\n\nСкачайте вручную: {FFMPEG_URL}")
+        finally:
+            try:
+                os.unlink(zpath)
+            except OSError:
+                pass
+            self._check_ffmpeg()
+
+    # ---------- info ----------
+
+    def _get_info_async(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Ссылка", "Вставьте ссылку на YouTube")
+            return
+        if not self._check_browsers_before_download():
+            return
+        self._refresh_browser_status()
+        threading.Thread(target=self._get_info, args=(url,), daemon=True).start()
+
+    def _get_info(self, url: str):
+        browser = self._active_browser()
+        try:
+            if browser:
+                self._log(f"Получаю информацию через cookies из {browser}...")
+            else:
+                self._log(f"Получаю информацию: {url}")
+            self.title_lbl.config(text="Название: загружаю...")
+            info = self.downloader.extract_info(
+                url,
+                cookies_file=self.cookies_path,
+                cookies_from_browser=browser,
+                proxy=self.proxy_var.get().strip() or None,
+            )
+            if not info:
+                raise RuntimeError("YouTube не вернул данные по этой ссылке")
+
+            is_playlist = "entries" in info
+            count = len(info.get("entries") or []) if is_playlist else 1
+            title = info.get("playlist_title") if is_playlist else info.get("title")
+            duration = format_duration(info.get("duration"))
+            channel = info.get("channel") or info.get("uploader") or "—"
+
+            self.after(0, lambda: self.title_lbl.config(text=f"Название: {title or '—'}"))
+            self.after(
+                0,
+                lambda: self.meta_lbl.config(
+                    text=f"{'Плейлист' if is_playlist else 'Видео'}"
+                    f" · {count} шт."
+                    f" · Длительность: {duration}"
+                    f" · Канал: {channel}"
+                    + (f" · Качество: {info['height']}p" if info.get("height") else "")
+                ),
+            )
+            self._log(f"Готово: {title or '—'} ({count} шт.)")
+            if not self.cookies_path and not browser and (info.get("height") or 0) <= 360:
+                self._log(
+                    "Внимание: без cookies YouTube ограничивает качество 360p. "
+                    "Загрузите cookies.txt во вкладке «Настройки» для 1080p и выше."
+                )
+            if info.get("height"):
+                self._log(f"Доступные качества до {info['height']}p")
+        except Exception as e:
+            err = str(e)
+            self._log(f"Ошибка: {err}")
+            messagebox.showerror("Ошибка получения информации", f"{err}{self._hint_for_error(err)}")
+
+    @staticmethod
+    def _hint_for_error(err: str) -> str:
+        low = err.lower()
+        if any(
+            m in low
+            for m in (
+                "connection reset",
+                "connection aborted",
+                "unable to download api page",
+                "getaddrinfo",
+                "failed to resolve",
+                "connection refused",
+                "remote end closed",
+                "ssl",
+                "timed out",
+            )
+        ):
+            return (
+                "\n\nПохоже, ваша сеть блокирует YouTube (частая ситуация в России — блокировка по имени домена/SNI).\n\n"
+                "Ни один локальный загрузчик в такой сети качать не сможет — проблема не в программе.\n\n"
+                "Что делать:\n"
+                "1. Включите VPN\n"
+                "2. Либо укажите прокси в «Настройки» → Сеть и прокси\n"
+                "3. Нажмите там же «Проверить сеть», чтобы подтвердить причину\n\n"
+                "Формат прокси: http://хост:порт или socks5://хост:порт"
+            )
+        if "could not copy" in low and "cookie" in low:
+            return (
+                "\n\nБраузер держит файл cookies заблокированным.\n\n"
+                "Что делать:\n"
+                "1. Полностью закройте браузер (не только окно — проверьте трей и диспетчер задач)\n"
+                "2. Повторите попытку\n\n"
+                "Если не помогло — выберите другой браузер в «Настройки» → Cookies, "
+                "либо загрузите cookies.txt вручную."
+            )
+        if "could not find" in low and "cookie" in low or "no such file" in low and "cookie" in low:
+            return (
+                "\n\nУ выбранного браузера нет файлов cookies — значит, вы в нём не авторизованы на YouTube.\n\n"
+                "Войдите в YouTube в этом браузере и повторите."
+            )
+        if "failed to decrypt with dpapi" in low or ("decrypt" in low and "app-bound" in low):
+            return (
+                "\n\nChrome/Edge 127+ шифруют cookies ключом, привязанным к самому браузеру. "
+                "Внешняя программа их не расшифрует — это ограничение безопасности, закрытие браузера НЕ поможет.\n\n"
+                "Что делать:\n"
+                "1. Установите расширение Cookie-Editor в Chrome/Edge\n"
+                "2. Откройте youtube.com (под своим аккаунтом) и экспортируйте cookies в Netscape (.txt)\n"
+                "3. «Настройки» → Cookies → «Загрузить» → выберите файл\n\n"
+                "Альтернатива: Firefox читается напрямую без ограничений."
+            )
+        if "decrypt" in low or "app-bound" in low or "dpapi" in low:
+            return (
+                "\n\nНе удалось расшифровать cookies.\n\n"
+                "Закройте браузер и повторите; выберите другой браузер; "
+                "либо загрузите cookies.txt вручную через «Настройки» → Cookies."
+            )
+        if "age" in low or "confirm your age" in low:
+            return "\n\nПохоже на возрастное ограничение — нужны cookies из браузера, где вы вошли в YouTube."
+        if "private" in low:
+            return "\n\nВидео приватное — доступно только по ссылке для приглашённых."
+        if "unavailable" in low or "not available" in low:
+            return "\n\nВидео удалено или недоступно в вашем регионе."
+        if "sign in" in low or "bot" in low or "429" in low:
+            return (
+                "\n\nYouTube требует подтверждение «я не робот».\n\n"
+                "Что делать:\n"
+                "1. Экспортируйте cookies.txt расширением Cookie-Editor, будучи авторизованным на YouTube\n"
+                "2. Загрузите файл в «Настройки» → Cookies\n\n"
+                "Важно: годятся только cookies СО входом. Если в файле нет SID и LOGIN_INFO — "
+                "YouTube всё равно считает вас гостем (в «Настройках» будет пометка «БЕЗ входа в аккаунт»).\n"
+                "На Chrome/Edge 127+ cookies напрямую из браузера не читаются — только файлом."
+            )
+        return ""
+
+    # ---------- download ----------
+
+    def _download_async(self):
+        if self.is_downloading:
+            return
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Ссылка", "Вставьте ссылку на YouTube")
+            return
+
+        out_dir = Path(self.output_dir_var.get() or str(get_default_download_dir()))
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не могу создать папку:\n{out_dir}\n\n{e}")
+            return
+
+        if not self._check_browsers_before_download():
+            return
+
+        self.is_downloading = True
+        self.btn_download.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.progress_bar["value"] = 0
+        self.percent_lbl.config(text="0%")
+        self.status_var.set("Подготовка...")
+        self._log(f"Старт загрузки в {out_dir}")
+
+        args = dict(
+            url=url,
+            output_dir=out_dir,
+            format_selector=self.format_var.get(),
+            audio_format=self.audio_format_var.get(),
+            audio_quality=self.audio_quality_var.get(),
+            playlist_start=max(1, self.playlist_start_var.get() or 1),
+            playlist_end=0 if self.playlist_all_var.get() else max(0, self.playlist_end_var.get() or 0),
+            cookies_file=self.cookies_path,
+            cookies_from_browser=self._active_browser(),
+            proxy=self.proxy_var.get().strip() or None,
+            restrict_filenames=self.restrict_names_var.get(),
+        )
+        threading.Thread(target=self._worker, args=(args,), daemon=True).start()
+
+    def _worker(self, args: dict):
+        try:
+            self.downloader.download(**args)
+        except Exception as e:
+            self._log(f"Критическая ошибка: {e}")
+        finally:
+            final = self.downloader.progress
+            if final.status == "done":
+                self._log("Загрузка завершена успешно")
+                self.after(0, lambda: messagebox.showinfo("Готово", f"Файл сохранён в:\n{args['output_dir']}"))
+            elif final.status == "cancelled":
+                self._log("Загрузка отменена")
+            elif final.status == "error":
+                self._log(f"Ошибка загрузки: {final.error}")
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка загрузки",
+                        f"{final.error or 'Неизвестная ошибка'}{self._hint_for_error(final.error or '')}",
+                    ),
+                )
+            self.after(0, self._finish)
+            self._save_config()
+
+    def _finish(self):
+        self.is_downloading = False
+        self.btn_download.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+
+    def _stop_download(self):
+        if not self.is_downloading:
+            return
+        self._log("Останавливаю...")
+        self.downloader.stop()
+        self.btn_stop.configure(state="disabled")
+        self.status_var.set("Останавливаю...")
+
+    def on_progress(self, p: DownloadProgress):
+        self.after(0, lambda: self._render(p))
+
+    def _render(self, p: DownloadProgress):
+        if p.status == "extracting":
+            if p.retry_message:
+                self.status_var.set(p.retry_message)
+            else:
+                self.status_var.set("Получаю информацию с YouTube...")
+        elif p.status == "downloading":
+            counter = f" [{p.current_index}/{p.total_count}]" if p.is_playlist and p.total_count else ""
+            self.status_var.set(f"Загрузка{counter}...")
+            pct = round(p.percent, 1)
+            self.progress_bar["value"] = pct
+            self.percent_lbl.config(text=f"{pct}%")
+            self.speed_var.set(f"Скорость: {format_bytes(int(p.speed))}/с" if p.speed > 0 else "Скорость: —")
+            self.eta_var.set(f"Осталось: {format_eta(p.eta)}")
+            if p.total > 0:
+                self.size_var.set(f"{format_bytes(p.downloaded)} / {format_bytes(p.total)}")
+            else:
+                self.size_var.set(format_bytes(p.downloaded))
+            if p.filename:
+                self.fname_lbl.config(text=Path(p.filename).name)
+        elif p.status == "merging":
+            self.progress_bar["value"] = 99
+            self.percent_lbl.config(text="99%")
+            self.status_var.set("Склеиваю видео + аудио (FFmpeg)...")
+            self.speed_var.set("Скорость: —")
+        elif p.status == "done":
+            self.progress_bar["value"] = 100
+            self.percent_lbl.config(text="100%")
+            self.status_var.set("Готово")
+            self.speed_var.set("Скорость: —")
+            self.eta_var.set("Осталось: —")
+            self.size_var.set("Готово")
+        elif p.status == "cancelled":
+            self.status_var.set("Отменено")
+        elif p.status == "error":
+            self.status_var.set("Ошибка")
+
+    def _on_close(self):
+        if self.is_downloading:
+            if not messagebox.askyesno("Выход", "Идёт загрузка. Остановить и выйти?"):
+                return
+            self.downloader.stop()
+        self._save_config()
+        try:
+            stop_server()
+        except Exception:
+            pass
+        self.destroy()
+
+
+def main():
+    app = YTApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
