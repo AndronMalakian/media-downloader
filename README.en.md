@@ -28,12 +28,17 @@ Media Downloader is a simple desktop app for Windows. It runs entirely locally: 
 - 🎵 **Audio only** — mp3, m4a, opus, wav with bitrate selection
 - 📼 **Video only** — no sound track
 - 📚 **Playlists** — full or by index range
+- 🎯 **Format table** — pick the exact resolution, codec, FPS and size
+- 📋 **Download queue** — many links at once, 1–4 threads
 - ⚡ **Shorts** and regular videos
 - 📊 **Progress** — percent, speed, ETA, file size
 - ⏹ **Cancel** in-flight downloads
 - 🍪 **Cookies** — for age-restricted and private videos
 - 🔁 **Auto-retry** — up to 3 attempts with different strategies
-- 💾 **Remembers settings** between launches
+- 🗂 **Download archive** — skips files you already downloaded
+- 🔄 **yt-dlp updater** — update from inside the app
+- ⌨️ **Hotkeys** and clipboard link auto-fill
+- 💾 **Remembers settings** between launches (including window size and position)
 - 📦 **Portable `.exe`** — no Python required
 
 ## 🌍 Supported sites
@@ -89,7 +94,7 @@ python main.py
 
 1. **Paste a link** to a video, audio track or playlist.
 2. Click **Get info** — title, channel and duration appear.
-3. On the **Format** tab choose what to download: best quality, video only, or audio only.
+3. On the **Format** tab choose what to download: best quality, video only, or audio only. A **format table** lets you pick an exact resolution, codec and size.
 4. Click **Download**. Progress and log appear at the bottom.
 5. The file is saved to your download folder (**Open folder** button).
 
@@ -97,6 +102,29 @@ python main.py
 <img src="docs/screenshots/03-settings.png" width="49%" alt="Settings">
 <img src="docs/screenshots/02-playlist.png" width="49%" alt="Playlist">
 </div>
+
+### 📋 Download queue
+
+The **Queue** tab downloads many links at once:
+
+1. Paste links (one per line) or use **From file...** / **Paste**.
+2. Pick the number of threads (1–4) and click **Add to queue**.
+3. Click **Download all** — each link shows status and percent; **Stop** halts the queue.
+
+### ⌨️ Hotkeys
+
+| Keys | Action |
+|---|---|
+| `Enter` / `F5` | Get info for the link |
+| `Ctrl+D` | Start download |
+| `Esc` | Stop download |
+| `Ctrl+O` | Open download folder |
+
+If the link field is empty and your clipboard holds a link, the app fills it in automatically.
+
+## 🗂 Download archive
+
+Enable **Settings → Download archive → Skip already downloaded** — the app remembers what it downloaded and won't download the same links or playlist twice. The list is stored in a separate file (path is configurable).
 
 ## 🧩 Requirements
 
@@ -171,13 +199,20 @@ Empty means a direct connection. The local PO Token server (`127.0.0.1`) always 
 
 ## ⬆️ Updating
 
-Sites change their protections occasionally. When the app stops working, update the engine:
+Sites change their protections occasionally, so it pays to keep yt-dlp fresh. The app has it built in: **Settings → yt-dlp update**.
+
+- **Check for updates** — shows the installed and the latest version.
+- **Update yt-dlp** — installs the latest version (when running from source).
+
+On startup the app quietly checks for a new version and logs it.
+
+> In the packaged `.exe` yt-dlp is bundled, so updates ship as a new app release from the [**Releases**](../../releases/latest) page.
+
+Manually (from source):
 
 ```bat
 py -m pip install -U yt-dlp
 ```
-
-If you use the `.exe`, grab a fresh release or rebuild it.
 
 ## 👨‍💻 Development
 

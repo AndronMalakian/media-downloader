@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -351,4 +352,76 @@ def check_youtube_network(timeout: float = 8.0) -> dict:
             "Похоже на общий сбой канала или блокировку шифрованного трафика."
         ),
     }
+
+
+def looks_like_url(text: str) -> bool:
+    """Грубая проверка, похож ли текст на ссылку (одно слово без пробелов)."""
+    text = (text or "").strip()
+    if not text or any(ch.isspace() for ch in text):
+        return False
+    return bool(re.match(r"^(https?://)?[\w\-]+(\.[\w\-]+)+(/\S*)?$", text, re.I))
+
+
+def get_installed_ytdlp_version() -> str:
+    try:
+        from yt_dlp.version import __version__
+
+        return __version__
+    except Exception:
+        return ""
+
+
+def get_latest_pypi_version(package: str = "yt-dlp", timeout: float = 10.0) -> str | None:
+    """Последняя версия пакета на PyPI (None, если сети нет)."""
+    try:
+        r = requests.get(
+            f"https://pypi.org/pypi/{package}/json",
+            timeout=timeout,
+            headers={"User-Agent": "Media-Downloader"},
+        )
+        r.raise_for_status()
+        return (r.json().get("info") or {}).get("version")
+    except Exception:
+        return None
+
+
+def version_key(version: str) -> tuple:
+    """Приводит версию вида 2026.08.19 к кортежу чисел для сравнения."""
+    out: list[int] = []
+    for part in re.split(r"[.\-_+]", (version or "").strip()):
+        m = re.match(r"(\d+)", part)
+        out.append(int(m.group(1)) if m else 0)
+    while len(out) < 4:
+        out.append(0)
+    return tuple(out[:4])
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    """True, если candidate новее current."""
+    if not candidate or not current:
+        return False
+    try:
+        return version_key(candidate) > version_key(current)
+    except Exception:
+        return False
+
+
+def can_self_update() -> bool:
+    """Можно ли обновлять пакеты (программа запущена из исходников, а не .exe)."""
+    return not getattr(sys, "frozen", False)
+
+
+def ytdlp_update_command() -> list[str] | None:
+    if not can_self_update():
+        return None
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--disable-pip-version-check",
+        "yt-dlp",
+        "yt-dlp-ejs",
+    ]
 

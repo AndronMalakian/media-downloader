@@ -175,7 +175,9 @@ class MediaDownloader:
         self,
         url: str,
         output_dir: Path,
-        format_selector: str = "best",
+        mode: str = "best",
+        custom_format: str | None = None,
+        custom_audio_only: bool = False,
         audio_format: str = "mp3",
         audio_quality: str = "192",
         playlist_start: int = 1,
@@ -184,6 +186,7 @@ class MediaDownloader:
         cookies_from_browser: str | None = None,
         proxy: str | None = None,
         restrict_filenames: bool = True,
+        download_archive: str | None = None,
     ):
         self._stop_event.clear()
         self.progress = DownloadProgress()
@@ -209,7 +212,6 @@ class MediaDownloader:
             "concurrent_fragment_downloads": 5,
             "http_chunk_size": 1048576,
             "buffersize": 16777216,
-            "merge_output_format": "mp4",
             "socket_timeout": 30,
         }
 
@@ -218,21 +220,35 @@ class MediaDownloader:
         if cookies_from_browser:
             opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
+        if download_archive:
+            try:
+                Path(download_archive).parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            opts["download_archive"] = download_archive
+
         ffmpeg = find_ffmpeg()
         if ffmpeg:
             opts["ffmpeg_location"] = ffmpeg
 
-        if format_selector == "bestaudio":
+        if mode == "audio":
             opts["format"] = "ba/best"
             codec = audio_format if audio_format in ("mp3", "m4a", "opus", "wav") else "mp3"
             pp = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
             if codec != "wav":
                 pp["preferredquality"] = audio_quality
             opts["postprocessors"] = [pp, {"key": "FFmpegMetadata"}]
-        elif format_selector == "bestvideo":
-            opts["format"] = "bv*+ba/b"
+        elif mode == "video":
+            # Только видео, без звуковой дорожки
+            opts["format"] = "bv*/b"
+        elif mode == "custom":
+            opts["format"] = custom_format or "bv*+ba/b"
         else:
             opts["format"] = "bv*+ba/b"
+
+        # Объединяем в mp4 только когда в результате есть видео и аудио.
+        if mode == "best" or (mode == "custom" and not custom_audio_only):
+            opts["merge_output_format"] = "mp4"
 
         if playlist_end and playlist_end >= playlist_start:
             opts["playlist_items"] = f"{playlist_start}:{playlist_end}"

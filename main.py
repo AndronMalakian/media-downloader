@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import sys
 import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -54,12 +56,19 @@ from utils import (
     format_eta,
     get_default_download_dir,
     get_ffmpeg_download,
+    get_installed_ytdlp_version,
+    get_latest_pypi_version,
     is_browser_running,
+    is_newer_version,
+    looks_like_url,
+    ytdlp_update_command,
 )
 
 CONFIG_FILE = Path.home() / ".media_downloader_config.json"
 LEGACY_CONFIG_FILE = Path.home() / ".yt_downloader_config.json"
 FFMPEG_URL = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest"
+RELEASES_URL = "https://github.com/TTsanchez/media-downloader/releases/latest"
+DEFAULT_ARCHIVE_FILE = Path.home() / ".media_downloader_archive.txt"
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -123,7 +132,7 @@ class VScroll(ttkb.Frame):
 
 class YTApp(ttkb.Window):
     def __init__(self):
-        super().__init__(title="Media Downloader", size=(960, 720), minsize=(880, 580))
+        super().__init__(title="Media Downloader", size=(1000, 880), minsize=(900, 780))
         self._fit_to_screen()
         try:
             ico = resource_path("icon.ico")
@@ -140,6 +149,9 @@ class YTApp(ttkb.Window):
         self._init_vars()
         self._build_ui()
         self._apply_config()
+        self._ui_ready = True
+        self._save_config()
+        self._restore_geometry()
         self._check_ffmpeg()
         self._refresh_browser_list()
         saved = getattr(self, "_saved_browser", "без cookies")
@@ -151,8 +163,11 @@ class YTApp(ttkb.Window):
         self._refresh_browser_status()
         self._check_components()
         threading.Thread(target=self._autostart_pot, daemon=True).start()
+        self._setup_shortcuts()
+        self.bind("<FocusIn>", self._on_focus_in)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("Готово. Вставьте ссылку с YouTube и нажмите «Получить информацию»")
+        self._check_updates_async()
 
     def _fit_to_screen(self):
         """Подгоняет окно под экран, чтобы нижние кнопки не уезжали за край."""
@@ -160,12 +175,32 @@ class YTApp(ttkb.Window):
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         except Exception:
             return
-        w = min(980, max(880, sw - 60))
-        h = min(720, max(560, sh - 90))
+        w = min(1040, max(900, sw - 60))
+        h = min(900, max(620, sh - 70))
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 3)
-        self.minsize(880, min(650, h))
+        self.minsize(900, min(780, h))
         self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _restore_geometry(self):
+        """Восстанавливает размер и положение окна из прошлого запуска."""
+        geo = (self.config.get("geometry") or "").strip()
+        if not geo:
+            return
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geo)
+        if not m:
+            return
+        try:
+            w, h, x, y = (int(m.group(i)) for i in range(1, 5))
+            if w < 900 or h < 780:
+                return
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            x = max(-w + 120, min(x, sw - 120))
+            y = max(0, min(y, sh - 120))
+            self.minsize(900, min(780, h))
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     def _set_theme(self):
         for name in ("bootstrap-dark", "darkly", "cyborg", "superhero"):
@@ -187,15 +222,20 @@ class YTApp(ttkb.Window):
         return {}
 
     def _save_config(self):
+        if not getattr(self, "_ui_ready", False):
+            return
         try:
             data = {
                 "output_dir": self.output_dir_var.get(),
                 "audio_format": self.audio_format_var.get(),
                 "audio_quality": self.audio_quality_var.get(),
                 "restrict_filenames": self.restrict_names_var.get(),
+                "skip_downloaded": self.skip_downloaded_var.get(),
+                "archive_file": self.archive_var.get().strip(),
                 "browser": self._active_browser() or "без cookies",
                 "cookies_file": self.cookies_path or "",
                 "proxy": self.proxy_var.get().strip(),
+                "geometry": self.winfo_geometry(),
             }
             CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -206,6 +246,8 @@ class YTApp(ttkb.Window):
         self.audio_format_var.set(self.config.get("audio_format", "mp3"))
         self.audio_quality_var.set(self.config.get("audio_quality", "192"))
         self.restrict_names_var.set(self.config.get("restrict_filenames", True))
+        self.skip_downloaded_var.set(bool(self.config.get("skip_downloaded", False)))
+        self.archive_var.set(self.config.get("archive_file") or str(DEFAULT_ARCHIVE_FILE))
         self._saved_browser = self.config.get("browser", "без cookies")
         self.proxy_var.set(self.config.get("proxy", ""))
 
@@ -225,6 +267,8 @@ class YTApp(ttkb.Window):
         self.audio_format_var = v(value="mp3")
         self.audio_quality_var = v(value="192")
         self.restrict_names_var = tk.BooleanVar(value=True)
+        self.skip_downloaded_var = tk.BooleanVar(value=False)
+        self.archive_var = v(value=str(DEFAULT_ARCHIVE_FILE))
         self.browser_var = v(value="без cookies")
         self.proxy_var = v()
         self._browser_by_label: dict[str, str | None] = {"без cookies": None}
@@ -236,6 +280,24 @@ class YTApp(ttkb.Window):
         self.speed_var = v(value="—")
         self.eta_var = v(value="—")
         self.size_var = v(value="—")
+        self._last_clip = ""
+        self._ui_ready = False
+
+        # формат-таблица
+        self._fmt_map: dict[str, tuple[str, str]] = {}
+        self._selected_format: str | None = None
+        self._selected_audio_only = False
+        self._selected_label = ""
+
+        # очередь
+        self.q_parallel_var = tk.IntVar(value=1)
+        self.queue_items: list[dict] = []
+        self._q_lock = threading.Lock()
+        self._q_running = False
+        self._q_stop = threading.Event()
+        self._q_active: dict[int, MediaDownloader] = {}
+        self._q_done_count = 0
+        self._q_error_count = 0
 
     # ---------- ui ----------
 
@@ -274,19 +336,19 @@ class YTApp(ttkb.Window):
         self.meta_lbl = ttkb.Label(url_box, text="Длительность: —    Канал: —", font=("Segoe UI", 8), bootstyle="secondary", wraplength=860, justify=LEFT)
         self.meta_lbl.pack(anchor="w", fill=X, pady=(2, 0))
 
-        nb = ttkb.Notebook(self, padding=(0, 2))
+        self.nb = nb = ttkb.Notebook(self, padding=(0, 2))
         nb.pack(fill=X, padx=20)
 
         tab_fmt = ttkb.Frame(nb, padding=(16, 8, 16, 8))
         nb.add(tab_fmt, text="Формат")
         fbox = ttkb.LabelFrame(tab_fmt, text=" Что скачивать ", padding=(14, 8, 14, 8))
         fbox.pack(fill=X)
-        self.rb_best = ttkb.Radiobutton(fbox, text="Лучшее качество — видео + аудио (MP4)", variable=self.format_var, value="best", command=self._update_state)
+        self.rb_best = ttkb.Radiobutton(fbox, text="Лучшее качество — видео + аудио (MP4)", variable=self.format_var, value="best", command=self._on_mode_change)
         self.rb_best.pack(anchor="w", pady=1)
         add_tooltip(self.rb_best, "Скачает лучшее доступное видео и лучшую дорожку звука, затем склеит в один MP4")
-        self.rb_video = ttkb.Radiobutton(fbox, text="Только видео (без звука)", variable=self.format_var, value="bestvideo", command=self._update_state)
+        self.rb_video = ttkb.Radiobutton(fbox, text="Только видео (без звука)", variable=self.format_var, value="bestvideo", command=self._on_mode_change)
         self.rb_video.pack(anchor="w", pady=1)
-        self.rb_audio = ttkb.Radiobutton(fbox, text="Только аудио", variable=self.format_var, value="bestaudio", command=self._update_state)
+        self.rb_audio = ttkb.Radiobutton(fbox, text="Только аудио", variable=self.format_var, value="bestaudio", command=self._on_mode_change)
         self.rb_audio.pack(anchor="w", pady=1)
 
         self.audio_box = ttkb.LabelFrame(tab_fmt, text=" Настройки аудио ", padding=(14, 6, 14, 6))
@@ -305,6 +367,76 @@ class YTApp(ttkb.Window):
         ttkb.Label(self.audio_box, text="mp3 — универсальный · m4a — Apple · opus — лучшее сжатие · wav — без потерь", bootstyle="secondary", font=("Segoe UI", 8)).pack(
             anchor="w", pady=(6, 0)
         )
+
+        tblbox = ttkb.LabelFrame(tab_fmt, text=" Конкретный формат — выберите строку (появится после «Получить информацию») ", padding=(10, 6, 10, 6))
+        tblbox.pack(fill=BOTH, expand=True, pady=(6, 0))
+        cols = ("quality", "type", "codec", "fps", "size", "note")
+        self.fmt_tree = ttkb.Treeview(tblbox, columns=cols, show="headings", height=5, bootstyle="light")
+        for cid, text, w, anchor in (
+            ("quality", "Качество", 110, "w"),
+            ("type", "Тип", 110, "w"),
+            ("codec", "Кодек", 150, "w"),
+            ("fps", "FPS", 50, "center"),
+            ("size", "Размер", 100, "e"),
+            ("note", "Примечание", 240, "w"),
+        ):
+            self.fmt_tree.heading(cid, text=text)
+            self.fmt_tree.column(cid, width=w, anchor=anchor, stretch=(cid == "note"))
+        self.fmt_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        fsb = ttkb.Scrollbar(tblbox, orient=VERTICAL, command=self.fmt_tree.yview)
+        fsb.pack(side=RIGHT, fill=Y)
+        self.fmt_tree.configure(yscrollcommand=fsb.set)
+        self.fmt_tree.bind("<<TreeviewSelect>>", self._on_format_select)
+        self.fmt_lbl = ttkb.Label(tab_fmt, text="Формат не выбран — используется выбор выше.", bootstyle="secondary", font=("Segoe UI", 8))
+        self.fmt_lbl.pack(anchor="w", pady=(4, 0))
+
+        tab_q = ttkb.Frame(nb, padding=(16, 8, 16, 8))
+        nb.add(tab_q, text="Очередь")
+
+        qin = ttkb.LabelFrame(tab_q, text=" Ссылки — по одной в строке ", padding=(12, 8, 12, 8))
+        qin.pack(fill=X)
+        self.queue_input = tk.Text(
+            qin, height=3, wrap="none", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
+            insertbackground="white", borderwidth=0, padx=8, pady=6, relief="flat",
+        )
+        self.queue_input.pack(fill=X)
+        qrow = ttkb.Frame(qin)
+        qrow.pack(fill=X, pady=(6, 0))
+        ttkb.Button(qrow, text="Добавить в очередь", width=20, bootstyle="primary", command=self._queue_add).pack(side=LEFT)
+        ttkb.Button(qrow, text="Из файла...", width=14, bootstyle="light-outline", command=self._queue_add_from_file).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(qrow, text="Вставить", width=12, bootstyle="light-outline", command=self._queue_paste).pack(side=LEFT, padx=(6, 0))
+        ttkb.Label(qrow, text="Параллельно:", bootstyle="secondary", font=("Segoe UI", 8)).pack(side=RIGHT, padx=(0, 6))
+        ttkb.Spinbox(qrow, from_=1, to=4, textvariable=self.q_parallel_var, width=4).pack(side=RIGHT)
+
+        qlist = ttkb.LabelFrame(tab_q, text=" Очередь ", padding=(10, 6, 10, 6))
+        qlist.pack(fill=BOTH, expand=True, pady=(6, 0))
+        qcols = ("num", "title", "fmt", "status", "progress")
+        self.queue_tree = ttkb.Treeview(qlist, columns=qcols, show="headings", height=5, bootstyle="light")
+        for cid, text, w, anchor in (
+            ("num", "№", 44, "center"),
+            ("title", "Ссылка / название", 380, "w"),
+            ("fmt", "Формат", 150, "w"),
+            ("status", "Статус", 110, "center"),
+            ("progress", "Прогресс", 90, "center"),
+        ):
+            self.queue_tree.heading(cid, text=text)
+            self.queue_tree.column(cid, width=w, anchor=anchor, stretch=(cid == "title"))
+        self.queue_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        qsb = ttkb.Scrollbar(qlist, orient=VERTICAL, command=self.queue_tree.yview)
+        qsb.pack(side=RIGHT, fill=Y)
+        self.queue_tree.configure(yscrollcommand=qsb.set)
+        self.queue_tree.tag_configure("done", foreground="#66bb6a")
+        self.queue_tree.tag_configure("error", foreground="#ef5350")
+        self.queue_tree.tag_configure("working", foreground="#42a5f5")
+
+        qctrl = ttkb.Frame(tab_q)
+        qctrl.pack(fill=X, pady=(6, 0))
+        self.btn_q_start = ttkb.Button(qctrl, text="Скачать всё", width=16, bootstyle="success", command=self._queue_start)
+        self.btn_q_start.pack(side=LEFT)
+        self.btn_q_stop = ttkb.Button(qctrl, text="Остановить", width=14, bootstyle="danger", command=self._queue_stop, state="disabled")
+        self.btn_q_stop.pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(qctrl, text="Удалить выбранное", width=18, bootstyle="light-outline", command=self._queue_remove_selected).pack(side=LEFT, padx=(8, 0))
+        ttkb.Button(qctrl, text="Очистить", width=12, bootstyle="light-outline", command=self._queue_clear).pack(side=LEFT, padx=(8, 0))
 
         tab_pl = ttkb.Frame(nb, padding=(16, 8, 16, 8))
         nb.add(tab_pl, text="Плейлист")
@@ -346,6 +478,29 @@ class YTApp(ttkb.Window):
             variable=self.restrict_names_var,
             command=self._save_config,
         ).pack(anchor="w")
+
+        dbox = ttkb.LabelFrame(tab_set, text="Архив загрузок — не качать повторно", padding=(14, 10, 14, 10))
+        dbox.pack(fill=X, pady=(10, 0))
+        ttkb.Checkbutton(
+            dbox,
+            text="Пропускать уже скачанное (ведётся список скачанных роликов)",
+            variable=self.skip_downloaded_var,
+            command=self._save_config,
+        ).pack(anchor="w")
+        darow = ttkb.Frame(dbox)
+        darow.pack(fill=X, pady=(8, 0))
+        ttkb.Entry(darow, textvariable=self.archive_var).pack(side=LEFT, fill=X, expand=True, ipady=3)
+        ttkb.Button(darow, text="Обзор...", width=11, bootstyle="light-outline", command=self._browse_archive).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttkb.Label(
+            dbox,
+            text="Список хранится в отдельном файле. Повторный запуск тех же ссылок или плейлиста не скачает их заново.",
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(8, 0))
 
         cbox = ttkb.LabelFrame(tab_set, text="Cookies — для возрастных и приватных видео", padding=(14, 10, 14, 10))
         cbox.pack(fill=X, pady=(10, 0))
@@ -471,6 +626,30 @@ class YTApp(ttkb.Window):
             justify=LEFT,
         ).pack(anchor="w", pady=(6, 0))
 
+        ubox = ttkb.LabelFrame(tab_set, text="Обновление yt-dlp", padding=(14, 10, 14, 10))
+        ubox.pack(fill=X, pady=(10, 0))
+        self.ytdlp_lbl2 = ttkb.Label(ubox, text="yt-dlp: проверка...", wraplength=820, justify=LEFT)
+        self.ytdlp_lbl2.pack(anchor="w")
+        urow = ttkb.Frame(ubox)
+        urow.pack(fill=X, pady=(8, 0))
+        ttkb.Button(urow, text="Проверить обновления", width=20, bootstyle="light-outline", command=self._check_updates_async).pack(
+            side=LEFT
+        )
+        ttkb.Button(urow, text="Обновить yt-dlp", width=18, bootstyle="light-outline", command=self._update_ytdlp_async).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttkb.Label(
+            ubox,
+            text=(
+                "YouTube часто меняется, и свежий yt-dlp нередко решает ошибки загрузки.\n"
+                "В собранном .exe yt-dlp вшит внутри — там обновление выходит новой версией программы."
+            ),
+            bootstyle="secondary",
+            font=("Segoe UI", 8),
+            wraplength=820,
+            justify=LEFT,
+        ).pack(anchor="w", pady=(8, 0))
+
         pbox2 = ttkb.LabelFrame(self, text=" Прогресс ", padding=(16, 8, 16, 8))
         pbox2.pack(fill=X, padx=20, pady=(8, 0))
         self.progress_bar = ttkb.Progressbar(pbox2, orient=HORIZONTAL, mode="determinate", maximum=100, value=0)
@@ -496,9 +675,8 @@ class YTApp(ttkb.Window):
         self.btn_stop.pack(side=LEFT, padx=(8, 0))
         ttkb.Button(arow2, text="Очистить лог", width=14, bootstyle="light-outline", command=self._clear_log).pack(side=LEFT, padx=(8, 0))
         ttkb.Button(arow2, text="Папка загрузок", bootstyle="light-outline", command=self._open_dir).pack(side=LEFT, padx=(8, 0))
-        ttkb.Label(arow2, text="обновить yt-dlp:  py -m yt_dlp -U", bootstyle="secondary", font=("Segoe UI", 8)).pack(
-            side=RIGHT, padx=(10, 0)
-        )
+        self.ytdlp_lbl = ttkb.Label(arow2, text="yt-dlp: ...", bootstyle="secondary", font=("Segoe UI", 8))
+        self.ytdlp_lbl.pack(side=RIGHT, padx=(10, 0))
 
         lbox = ttkb.LabelFrame(self, text=" Журнал ", padding=(12, 8, 12, 8))
         lbox.pack(fill=BOTH, expand=True, padx=20, pady=(10, 10))
@@ -515,6 +693,402 @@ class YTApp(ttkb.Window):
         self.sp_start.configure(state=state)
         self.sp_end.configure(state=state)
         self._save_config()
+
+    # ---------- форматы ----------
+
+    def _on_mode_change(self):
+        self._selected_format = None
+        self._selected_audio_only = False
+        self._selected_label = ""
+        try:
+            sel = self.fmt_tree.selection()
+            if sel:
+                self.fmt_tree.selection_remove(*sel)
+        except Exception:
+            pass
+        try:
+            self.fmt_lbl.config(text="Формат не выбран — используется выбор выше.", bootstyle="secondary")
+        except Exception:
+            pass
+        self._update_state()
+
+    def _current_mode(self):
+        """Возвращает (mode, custom_format, custom_audio_only) для загрузки."""
+        if self._selected_format:
+            return "custom", self._selected_format, self._selected_audio_only
+        mode = {"best": "best", "bestvideo": "video", "bestaudio": "audio"}.get(self.format_var.get(), "best")
+        return mode, None, False
+
+    @staticmethod
+    def _pick_format_source(info: dict) -> dict | None:
+        if info.get("entries"):
+            for e in info["entries"]:
+                if e and e.get("formats"):
+                    return e
+            return None
+        return info
+
+    def _add_fmt_row(self, quality, typ, codec, fps, size, note, fmt, kind):
+        if not fmt:
+            return
+        iid = self.fmt_tree.insert("", "end", values=(quality, typ, codec, fps, size, note))
+        self._fmt_map[iid] = (str(fmt), kind)
+
+    def _populate_formats(self, info: dict):
+        for iid in self.fmt_tree.get_children():
+            self.fmt_tree.delete(iid)
+        self._fmt_map = {}
+        self._selected_format = None
+        self._selected_audio_only = False
+        self._selected_label = ""
+
+        if not info:
+            self.fmt_lbl.config(text="Формат не выбран — используется выбор выше.", bootstyle="secondary")
+            return
+
+        src = self._pick_format_source(info or {})
+        fmts = (src or {}).get("formats") or []
+        if not fmts:
+            self.fmt_lbl.config(text="Форматы недоступны для этой ссылки.", bootstyle="warning")
+            return
+
+        def size_of(f):
+            return f.get("filesize") or f.get("filesize_approx") or 0
+
+        video = [f for f in fmts if f.get("vcodec") not in (None, "none")]
+        audio_only = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+        heights = sorted({f.get("height") for f in video if f.get("height")}, reverse=True)
+        best_audio = max(audio_only, key=size_of) if audio_only else None
+
+        self._add_fmt_row("Лучшее", "видео+аудио", "авто", "", "", "самое высокое доступное", "bv*+ba/b", "merge")
+
+        for h in heights:
+            cands = [f for f in video if f.get("height") == h]
+            v = max(cands, key=size_of)
+            fps = v.get("fps")
+            codec = f'{v.get("ext", "?")} · {str(v.get("vcodec", "?")).split(".")[0]}'
+            total = size_of(v) + (size_of(best_audio) if best_audio else 0)
+            self._add_fmt_row(
+                f"{h}p", "видео+аудио", codec,
+                f"{fps:.0f}" if fps else "",
+                format_bytes(total) if total else "",
+                "склейка в MP4",
+                f"bv*[height<={h}]+ba/b[height<={h}]", "merge",
+            )
+
+        for f in sorted(video, key=lambda x: (x.get("height") or 0, size_of(x)), reverse=True):
+            h = f.get("height")
+            codec = f'{f.get("ext", "?")} · {str(f.get("vcodec", "?")).split(".")[0]}'
+            fps = f.get("fps")
+            self._add_fmt_row(
+                f"{h}p" if h else "видео", "видео (без звука)", codec,
+                f"{fps:.0f}" if fps else "",
+                format_bytes(size_of(f)) if size_of(f) else "",
+                f.get("format_note") or "",
+                f.get("format_id"), "video",
+            )
+
+        for f in sorted(audio_only, key=size_of, reverse=True)[:12]:
+            codec = f'{f.get("ext", "?")} · {str(f.get("acodec", "?")).split(".")[0]}'
+            abr = f.get("abr")
+            note = f"{abr:.0f} kbps" if abr else (f.get("format_note") or "")
+            self._add_fmt_row(
+                "аудио", "аудио", codec, "",
+                format_bytes(size_of(f)) if size_of(f) else "",
+                note, f.get("format_id"), "audio",
+            )
+
+        self.fmt_lbl.config(
+            text=f"Видео-форматов: {len(video)}, аудио: {len(audio_only)}. Выберите строку — она будет использована при загрузке.",
+            bootstyle="secondary",
+        )
+
+    def _on_format_select(self, _event=None):
+        sel = self.fmt_tree.selection()
+        if not sel:
+            return
+        data = self._fmt_map.get(sel[0])
+        if not data:
+            return
+        self._selected_format, kind = data
+        self._selected_audio_only = (kind == "audio")
+        self._selected_label = self.fmt_tree.set(sel[0], "quality")
+        self.fmt_lbl.config(
+            text=f"Выбран формат: {self._selected_label} ({kind}). Будет использован при загрузке.",
+            bootstyle="success",
+        )
+        self._log(f"Выбран формат: {self._selected_label} [{self._selected_format}]")
+
+    # ---------- очередь ----------
+
+    def _queue_paste(self):
+        try:
+            text = self.clipboard_get().strip()
+        except Exception:
+            return
+        if not text:
+            return
+        cur = self.queue_input.get("1.0", "end").strip()
+        self.queue_input.insert("end", ("\n" if cur else "") + text)
+
+    def _queue_add(self):
+        lines = [l.strip() for l in self.queue_input.get("1.0", "end").splitlines() if l.strip()]
+        if not lines:
+            messagebox.showinfo("Очередь", "Вставьте хотя бы одну ссылку.")
+            return
+        added = sum(1 for url in lines if self._queue_append(url))
+        self.queue_input.delete("1.0", "end")
+        if added:
+            self._log(f"В очередь добавлено ссылок: {added}")
+            self.status_var.set(f"В очереди: {len(self.queue_items)}")
+
+    def _queue_add_from_file(self):
+        chosen = filedialog.askopenfilename(title="Файл со ссылками", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not chosen:
+            return
+        try:
+            lines = Path(chosen).read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as e:
+            messagebox.showerror("Очередь", f"Не удалось прочитать файл:\n{e}")
+            return
+        added = 0
+        for line in lines:
+            url = line.strip()
+            if url and not url.startswith("#") and self._queue_append(url):
+                added += 1
+        self._log(f"Из файла добавлено ссылок: {added}")
+
+    def _queue_append(self, url: str) -> bool:
+        mode, custom_format, audio_only = self._current_mode()
+        if custom_format:
+            label = self._selected_label or "формат"
+        else:
+            label = {"best": "Лучшее", "video": "Видео", "audio": "Аудио"}.get(mode, mode)
+        num = len(self.queue_items) + 1
+        iid = self.queue_tree.insert("", "end", values=(num, url[:90], label, "ожидание", "0%"))
+        self.queue_items.append({
+            "num": num,
+            "url": url,
+            "title": url,
+            "status": "ожидание",
+            "percent": 0.0,
+            "error": "",
+            "mode": mode,
+            "custom_format": custom_format,
+            "audio_only": audio_only,
+            "audio_format": self.audio_format_var.get(),
+            "audio_quality": self.audio_quality_var.get(),
+            "start": max(1, self.playlist_start_var.get() or 1),
+            "end": 0 if self.playlist_all_var.get() else max(0, self.playlist_end_var.get() or 0),
+            "fmt_label": label,
+            "iid": iid,
+        })
+        return True
+
+    def _queue_update_row(self, item: dict):
+        try:
+            st = item["status"]
+            tags = ()
+            if st == "готово":
+                tags = ("done",)
+            elif st == "ошибка":
+                tags = ("error",)
+            elif st in ("загрузка", "инфо", "старт", "склейка"):
+                tags = ("working",)
+            self.queue_tree.item(
+                item["iid"],
+                values=(
+                    item.get("num", ""),
+                    (item.get("title") or item["url"])[:90],
+                    item.get("fmt_label", "—"),
+                    st,
+                    f"{item.get('percent', 0.0):.0f}%",
+                ),
+                tags=tags,
+            )
+        except Exception:
+            pass
+
+    def _queue_post(self, item: dict):
+        self.after(0, lambda it=item: self._queue_update_row(it))
+
+    def _queue_renumber(self):
+        for i, it in enumerate(self.queue_items, 1):
+            it["num"] = i
+            self._queue_update_row(it)
+
+    def _queue_clear(self):
+        if self._q_running:
+            messagebox.showinfo("Очередь", "Сначала остановите загрузку.")
+            return
+        for iid in self.queue_tree.get_children():
+            self.queue_tree.delete(iid)
+        self.queue_items.clear()
+        self._log("Очередь очищена")
+
+    def _queue_remove_selected(self):
+        if self._q_running:
+            messagebox.showinfo("Очередь", "Сначала остановите загрузку.")
+            return
+        sel = set(self.queue_tree.selection())
+        if not sel:
+            return
+        for it in list(self.queue_items):
+            if it["iid"] in sel:
+                self.queue_items.remove(it)
+        for iid in sel:
+            try:
+                self.queue_tree.delete(iid)
+            except Exception:
+                pass
+        self._queue_renumber()
+
+    def _queue_pick(self) -> dict | None:
+        with self._q_lock:
+            for it in self.queue_items:
+                if it["status"] == "ожидание":
+                    it["status"] = "старт"
+                    return it
+        return None
+
+    def _queue_start(self):
+        if self._q_running:
+            return
+        pending = [it for it in self.queue_items if it["status"] in ("ожидание", "ошибка", "отмена")]
+        if not pending:
+            messagebox.showinfo("Очередь", "Добавьте ссылки, которые нужно скачать.")
+            return
+        if not self._check_browsers_before_download():
+            return
+        self._q_stop.clear()
+        self._q_running = True
+        self._q_done_count = 0
+        self._q_error_count = 0
+        for it in pending:
+            it["status"] = "ожидание"
+            it["percent"] = 0.0
+            it["error"] = ""
+            self._queue_update_row(it)
+        self.btn_q_start.configure(state="disabled")
+        self.btn_q_stop.configure(state="normal")
+        self.status_var.set("Очередь: загрузка...")
+        self._log(f"Запускаю очередь из {len(pending)} ссылок (потоков: {max(1, int(self.q_parallel_var.get()))})")
+        n = max(1, min(4, int(self.q_parallel_var.get())))
+        for _ in range(n):
+            threading.Thread(target=self._queue_worker, daemon=True).start()
+        threading.Thread(target=self._queue_watch, daemon=True).start()
+
+    def _queue_worker(self):
+        while not self._q_stop.is_set():
+            item = self._queue_pick()
+            if item is None:
+                return
+            self._queue_download_item(item)
+
+    def _queue_download_item(self, item: dict):
+        item["status"] = "инфо"
+        self._queue_post(item)
+        out_dir = Path(self.output_dir_var.get() or str(get_default_download_dir()))
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            item["status"] = "ошибка"
+            item["error"] = str(e)
+            self._queue_post(item)
+            return
+
+        dl = MediaDownloader(progress_callback=lambda p: self.after(0, lambda pp=p: self._queue_on_progress(item, pp)))
+        with self._q_lock:
+            self._q_active[id(item)] = dl
+        try:
+            dl.download(
+                url=item["url"],
+                output_dir=out_dir,
+                mode=item["mode"],
+                custom_format=item["custom_format"],
+                custom_audio_only=item["audio_only"],
+                audio_format=item["audio_format"],
+                audio_quality=item["audio_quality"],
+                playlist_start=item["start"],
+                playlist_end=item["end"],
+                cookies_file=self.cookies_path,
+                cookies_from_browser=self._active_browser(),
+                proxy=self.proxy_var.get().strip() or None,
+                restrict_filenames=self.restrict_names_var.get(),
+                download_archive=self.archive_var.get().strip() if self.skip_downloaded_var.get() else None,
+            )
+            prog = dl.progress
+            if prog.status == "done":
+                item["status"] = "готово"
+                item["percent"] = 100.0
+                self._q_done_count += 1
+            elif prog.status == "cancelled":
+                item["status"] = "отмена"
+            else:
+                item["status"] = "ошибка"
+                item["error"] = prog.error or "ошибка"
+                self._q_error_count += 1
+        except Exception as e:
+            item["status"] = "ошибка"
+            item["error"] = str(e)
+            self._q_error_count += 1
+        finally:
+            with self._q_lock:
+                self._q_active.pop(id(item), None)
+            self._queue_post(item)
+
+    def _queue_on_progress(self, item: dict, p: DownloadProgress):
+        item["percent"] = p.percent
+        if p.filename:
+            item["title"] = Path(p.filename).name
+        if p.status == "downloading":
+            item["status"] = "загрузка"
+        elif p.status == "merging":
+            item["status"] = "склейка"
+        elif p.status == "extracting":
+            item["status"] = "инфо"
+        self._queue_update_row(item)
+
+    def _queue_watch(self):
+        while self._q_running:
+            with self._q_lock:
+                active = len(self._q_active)
+            remaining = any(it["status"] in ("ожидание", "старт", "загрузка", "инфо", "склейка") for it in self.queue_items)
+            if active == 0 and not remaining:
+                break
+            time.sleep(0.3)
+        self.after(0, self._queue_finish)
+
+    def _queue_finish(self):
+        self._q_running = False
+        try:
+            self.btn_q_start.configure(state="normal")
+            self.btn_q_stop.configure(state="disabled")
+        except Exception:
+            pass
+        done = sum(1 for it in self.queue_items if it["status"] == "готово")
+        err = sum(1 for it in self.queue_items if it["status"] == "ошибка")
+        cancelled = sum(1 for it in self.queue_items if it["status"] == "отмена")
+        self._log(f"Очередь завершена: готово {done}, ошибок {err}, отменено {cancelled}")
+        self.status_var.set(f"Очередь: готово {done}, ошибок {err}")
+
+    def _queue_stop(self):
+        if not self._q_running:
+            return
+        self._log("Останавливаю очередь...")
+        self._q_stop.set()
+        with self._q_lock:
+            actives = list(self._q_active.values())
+            for it in self.queue_items:
+                if it["status"] in ("ожидание", "старт"):
+                    it["status"] = "отмена"
+                    self.after(0, lambda i=it: self._queue_update_row(i))
+        for dl in actives:
+            try:
+                dl.stop()
+            except Exception:
+                pass
+        self.btn_q_stop.configure(state="disabled")
 
     # ---------- log ----------
 
@@ -553,6 +1127,7 @@ class YTApp(ttkb.Window):
         self.eta_var.set("—")
         self.size_var.set("—")
         self.fname_lbl.config(text="—")
+        self._populate_formats({})
         self._log("Ссылка очищена")
 
     def _browse_dir(self):
@@ -575,6 +1150,117 @@ class YTApp(ttkb.Window):
             self._log(f"Открыта папка: {p}")
         except Exception as e:
             self._log(f"Не удалось открыть папку: {e}")
+
+    def _browse_archive(self):
+        current = Path(self.archive_var.get() or str(DEFAULT_ARCHIVE_FILE))
+        chosen = filedialog.asksaveasfilename(
+            title="Файл архива загрузок",
+            initialfile=current.name or "download_archive.txt",
+            initialdir=str(current.parent),
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.archive_var.set(chosen)
+            self._save_config()
+            self._log(f"Файл архива: {chosen}")
+
+    # ---------- hotkeys / clipboard ----------
+
+    def _setup_shortcuts(self):
+        self.bind("<Control-d>", lambda e: self._download_async())
+        self.bind("<F5>", lambda e: self._get_info_async())
+        self.bind("<Escape>", lambda e: self._stop_download())
+        self.bind("<Control-o>", lambda e: self._open_dir())
+
+    def _on_focus_in(self, _event=None):
+        """Подставляет ссылку из буфера обмена, если поле пустое."""
+        if self.is_downloading:
+            return
+        try:
+            text = self.clipboard_get().strip()
+        except Exception:
+            return
+        if not text or text == self._last_clip:
+            return
+        self._last_clip = text
+        if self.url_var.get().strip() or not looks_like_url(text):
+            return
+        self.url_var.set(text)
+        self._log(f"Ссылка из буфера обмена: {text[:70]}")
+
+    # ---------- yt-dlp update ----------
+
+    def _check_updates_async(self):
+        threading.Thread(target=self._check_updates, daemon=True).start()
+
+    def _check_updates(self):
+        current = get_installed_ytdlp_version()
+        self.after(0, lambda: self._set_ytdlp_bottom(current))
+        latest = get_latest_pypi_version("yt-dlp")
+        if not latest:
+            self.after(
+                0,
+                lambda: self.ytdlp_lbl2.config(
+                    text=f"yt-dlp: установлена {current or '?'}. Не удалось проверить обновления (нет сети).",
+                    bootstyle="warning",
+                ),
+            )
+            return
+        if is_newer_version(latest, current):
+            self.after(
+                0,
+                lambda: self.ytdlp_lbl2.config(
+                    text=f"yt-dlp: установлена {current} — доступна новая версия {latest}.",
+                    bootstyle="warning",
+                ),
+            )
+            self.after(0, lambda: self._log(f"Доступно обновление yt-dlp: {current} → {latest}"))
+        else:
+            self.after(
+                0,
+                lambda: self.ytdlp_lbl2.config(
+                    text=f"yt-dlp: установлена {current} — это последняя версия.", bootstyle="success"
+                ),
+            )
+
+    def _set_ytdlp_bottom(self, version: str):
+        try:
+            self.ytdlp_lbl.config(text=f"yt-dlp: {version or '?'}")
+        except Exception:
+            pass
+
+    def _update_ytdlp_async(self):
+        if ytdlp_update_command() is None:
+            if messagebox.askyesno(
+                "Обновление yt-dlp",
+                "Эта сборка (.exe) содержит yt-dlp внутри — отдельно обновить его нельзя.\n\n"
+                "Скачайте новую версию программы со страницы релизов. Открыть её сейчас?",
+            ):
+                import webbrowser
+
+                webbrowser.open(RELEASES_URL)
+            return
+        if self.is_downloading:
+            messagebox.showinfo("Обновление yt-dlp", "Сначала дождитесь окончания загрузки.")
+            return
+        threading.Thread(target=self._update_ytdlp, daemon=True).start()
+
+    def _update_ytdlp(self):
+        self.after(0, lambda: self._log("Обновляю yt-dlp..."))
+        cmd = ytdlp_update_command()
+        code, out = _run_process(cmd, timeout=900) if cmd else (1, "обновление недоступно")
+        if code == 0:
+            self.after(0, lambda: self._log("yt-dlp обновлён. Перезапустите программу, чтобы применить."))
+            self.after(
+                0,
+                lambda: messagebox.showinfo("yt-dlp", "yt-dlp обновлён.\n\nПерезапустите программу для применения."),
+            )
+        else:
+            tail = (out or "").strip()[-500:]
+            self.after(0, lambda: self._log(f"Не удалось обновить yt-dlp:\n{tail}"))
+            self.after(0, lambda: messagebox.showerror("yt-dlp", "Не удалось обновить yt-dlp. Подробности в журнале."))
+        self.after(0, self._check_updates_async)
 
     def _load_cookies(self):
         chosen = filedialog.askopenfilename(title="Выберите cookies.txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -937,6 +1623,7 @@ class YTApp(ttkb.Window):
                 ),
             )
             self._log(f"Готово: {title or '—'} ({count} шт.)")
+            self.after(0, lambda: self._populate_formats(info))
             if not self.cookies_path and not browser and (info.get("height") or 0) <= 360:
                 self._log(
                     "Внимание: без cookies YouTube ограничивает качество 360p. "
@@ -1051,10 +1738,13 @@ class YTApp(ttkb.Window):
         self.status_var.set("Подготовка...")
         self._log(f"Старт загрузки в {out_dir}")
 
+        mode, custom_format, custom_audio_only = self._current_mode()
         args = dict(
             url=url,
             output_dir=out_dir,
-            format_selector=self.format_var.get(),
+            mode=mode,
+            custom_format=custom_format,
+            custom_audio_only=custom_audio_only,
             audio_format=self.audio_format_var.get(),
             audio_quality=self.audio_quality_var.get(),
             playlist_start=max(1, self.playlist_start_var.get() or 1),
@@ -1063,6 +1753,7 @@ class YTApp(ttkb.Window):
             cookies_from_browser=self._active_browser(),
             proxy=self.proxy_var.get().strip() or None,
             restrict_filenames=self.restrict_names_var.get(),
+            download_archive=self.archive_var.get().strip() if self.skip_downloaded_var.get() else None,
         )
         threading.Thread(target=self._worker, args=(args,), daemon=True).start()
 
@@ -1144,10 +1835,12 @@ class YTApp(ttkb.Window):
             self.status_var.set("Ошибка")
 
     def _on_close(self):
-        if self.is_downloading:
+        busy = self.is_downloading or self._q_running
+        if busy:
             if not messagebox.askyesno("Выход", "Идёт загрузка. Остановить и выйти?"):
                 return
             self.downloader.stop()
+            self._queue_stop()
         self._save_config()
         try:
             stop_server()
