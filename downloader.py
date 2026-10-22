@@ -9,15 +9,19 @@ from yt_dlp.utils import DownloadError, ExtractorError
 from utils import find_ffmpeg
 from pot import find_deno, server_running, start_server
 
-# Порядок клиентов YouTube. Если один не отдаёт видео (ошибка PO Token,
-# «страница требует перезагрузки», пустой список форматов), пробуем следующий.
-# Так же поступает QSaver: несколько попыток вместо одной.
-CLIENT_FALLBACKS: list[list[str]] = [
-    ["default", "web_embedded"],
-    ["mweb"],
-    ["tv_simply", "web_embedded"],
-    ["web_safari"],
-    ["default"],
+# Порядок клиентов YouTube. Если один не отдаёт видео (страница требует
+# перезагрузки, пустой список форматов), пробуем следующий.
+#
+# None на первом месте — НЕ трогать player_client и оставить yt-dlp собственные
+# дефолты. Так поступает mhogomchungu/media-downloader: он вообще не передаёт
+# extractor-args, и обычные публичные видео качаются без cookies. yt-dlp сам
+# выбирает клиент по состоянию (без логина -> visionos/web), а visionos не требует
+# ни cookies, ни PO Token, ни JS-рантайма (см. INNERTUBE_CLIENTS['visionos']).
+CLIENT_FALLBACKS: list[list[str] | None] = [
+    None,                          # чистые дефолты yt-dlp (без принудительного player_client)
+    ["web"],                       # чаще работает для живых трансляций /live/
+    ["visionos", "android_vr"],    # анонимные клиенты: часто без cookies и без PO Token
+    ["mweb", "tv"],                # запасные варианты (могут требовать PO Token)
 ]
 
 # Ошибки, при которых имеет смысл повторить с другим клиентом.
@@ -41,8 +45,13 @@ RETRYABLE_MARKERS = (
 MAX_ATTEMPTS = 3
 
 
-def build_runtime_opts(cookies_used: bool, clients: list[str] | None = None, proxy: str | None = None) -> dict:
-    """Опции, нужные для текущего состояния YouTube (PO token, JS-челлендж)."""
+def build_runtime_opts(clients: list[str] | None = None, proxy: str | None = None) -> dict:
+    """Опции, нужные для текущего состояния YouTube (PO token, JS-челлендж).
+
+    clients=None означает «не задавать player_client вообще» — тогда yt-dlp
+    использует свои дефолты и сам подбирает клиенты (без логина, с куками,
+    без JS-рантайма).
+    """
     opts: dict[str, Any] = {}
 
     if proxy:
@@ -52,12 +61,13 @@ def build_runtime_opts(cookies_used: bool, clients: list[str] | None = None, pro
     if deno:
         opts["js_runtimes"] = {"deno": {"path": deno}}
 
-    if clients is None:
-        clients = ["default", "web_embedded"] if cookies_used else ["default"]
-    args: dict[str, dict[str, list[str]]] = {"youtube": {"player_client": clients}}
+    args: dict[str, dict[str, list[str]]] = {}
+    if clients is not None:
+        args["youtube"] = {"player_client": list(clients)}
     if server_running():
         args["youtubepot-bgutilhttp"] = {"base_url": ["http://127.0.0.1:4416"]}
-    opts["extractor_args"] = args
+    if args:
+        opts["extractor_args"] = args
     return opts
 
 
@@ -124,13 +134,12 @@ class MediaDownloader:
         if ffmpeg:
             base_opts["ffmpeg_location"] = ffmpeg
 
-        cookies_used = bool(cookies_file or cookies_from_browser)
         last_error = ""
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             opts = dict(base_opts)
             ensure_pot_server()
-            opts.update(build_runtime_opts(cookies_used, clients=CLIENT_FALLBACKS[attempt - 1], proxy=proxy))
+            opts.update(build_runtime_opts(clients=CLIENT_FALLBACKS[attempt - 1], proxy=proxy))
             try:
                 with YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -257,7 +266,6 @@ class MediaDownloader:
             opts["playlist_items"] = f"{playlist_start}:"
             opts["ignoreerrors"] = True
 
-        cookies_used = bool(cookies_file or cookies_from_browser)
         last_error = ""
 
         try:
@@ -268,7 +276,7 @@ class MediaDownloader:
 
                 attempt_opts = dict(opts)
                 ensure_pot_server()
-                attempt_opts.update(build_runtime_opts(cookies_used, clients=CLIENT_FALLBACKS[attempt - 1], proxy=proxy))
+                attempt_opts.update(build_runtime_opts(clients=CLIENT_FALLBACKS[attempt - 1], proxy=proxy))
 
                 try:
                     with YoutubeDL(attempt_opts) as ydl:

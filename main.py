@@ -251,7 +251,9 @@ class YTApp(ttkb.Window):
         self._saved_browser = self.config.get("browser", "без cookies")
         self.proxy_var.set(self.config.get("proxy", ""))
 
-        # Восстанавливаем cookies.txt: без него YouTube отдаёт максимум 360p
+        # Восстанавливаем cookies.txt: для обычных публичных видео они не нужны
+        # (yt-dlp идёт анонимным клиентом), но нужны для возрастных/приватных видео
+        # и для «подтвердите, что вы не робот».
         saved_cookies = self.config.get("cookies_file", "")
         if saved_cookies and Path(saved_cookies).is_file():
             self.cookies_path = saved_cookies
@@ -1624,11 +1626,6 @@ class YTApp(ttkb.Window):
             )
             self._log(f"Готово: {title or '—'} ({count} шт.)")
             self.after(0, lambda: self._populate_formats(info))
-            if not self.cookies_path and not browser and (info.get("height") or 0) <= 360:
-                self._log(
-                    "Внимание: без cookies YouTube ограничивает качество 360p. "
-                    "Загрузите cookies.txt во вкладке «Настройки» для 1080p и выше."
-                )
             if info.get("height"):
                 self._log(f"Доступные качества до {info['height']}p")
         except Exception as e:

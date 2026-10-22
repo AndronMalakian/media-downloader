@@ -139,7 +139,9 @@ If not found, use **Download automatically** on the **Settings** tab.
 
 ## 🍪 Cookies
 
-Needed when YouTube asks to confirm you're not a bot, and for age-restricted, private or region-locked videos.
+Regular public videos do **not** need cookies — the app downloads them right away. yt-dlp picks the YouTube client itself: when logged out it uses the anonymous `visionos` client, which requires no cookies, no PO token and no JavaScript runtime.
+
+Cookies are only needed when YouTube asks to "confirm you're not a bot", and for age-restricted, private or account-bound videos.
 
 **Option 1 — read directly from the browser.** Settings → Cookies → pick a browser.
 
