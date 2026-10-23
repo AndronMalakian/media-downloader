@@ -33,6 +33,13 @@ jobs:
           --name "Media-Downloader"
           --icon "icon.ico"
           --add-data "icon.ico;."
+          --add-data "version.txt;."
+          --add-data "main.py;."
+          --add-data "downloader.py;."
+          --add-data "pot.py;."
+          --add-data "utils.py;."
+          --add-data "README.md;."
+          --add-data "README.en.md;."
           --collect-all ttkbootstrap
           --collect-all yt_dlp
           --collect-all yt_dlp_ejs
