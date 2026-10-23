@@ -3,9 +3,10 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+from typing import Optional, Tuple
 
 import requests
-from pathlib import Path
 
 
 GECKO_BROWSERS = {"firefox", "thunderbird", "librewolf", "waterfox"}
@@ -424,4 +425,107 @@ def ytdlp_update_command() -> list[str] | None:
         "yt-dlp",
         "yt-dlp-ejs",
     ]
+
+
+APP_REPO = "TTsanchez/media-downloader"
+APP_EXE_NAME = "Media-Downloader.exe"
+
+
+def get_app_version() -> str:
+    try:
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).parent
+        vfile = base / "version.txt"
+        if vfile.exists():
+            return vfile.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+def get_latest_app_release(timeout: int = 15) -> Optional[dict]:
+    try:
+        import requests
+
+        url = f"https://api.github.com/repos/{APP_REPO}/releases/latest"
+        headers = {"User-Agent": "Media-Downloader", "Accept": "application/vnd.github+json"}
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_app_asset_url(release: dict, asset_name: str = APP_EXE_NAME) -> Optional[str]:
+    try:
+        for asset in release.get("assets", []) or []:
+            if asset.get("name") == asset_name:
+                return asset.get("browser_download_url")
+    except Exception:
+        pass
+    return None
+
+
+def is_newer_app_version(remote_tag: str, local_ver: str) -> bool:
+    if not remote_tag or not local_ver:
+        return False
+    try:
+        from packaging.version import Version
+
+        rv = remote_tag.lstrip("vV").strip()
+        lv = local_ver.lstrip("vV").strip()
+        if not rv:
+            return False
+        return Version(rv) > Version(lv)
+    except Exception:
+        def _v(s: str):
+            parts = re.findall(r"\d+", s)
+            while len(parts) < 3:
+                parts.append("0")
+            return tuple(int(x) for x in parts[:3])
+
+        rv = _v(remote_tag)
+        lv = _v(local_ver)
+        return rv > lv
+
+
+def download_file(url: str, dest: Path, timeout: int = 600) -> bool:
+    try:
+        import requests
+
+        headers = {"User-Agent": "Media-Downloader"}
+        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def create_updater_script(new_exe: Path, current_exe: Path) -> Optional[Path]:
+    try:
+        bat = current_exe.parent / "Media-Downloader-update.bat"
+        content = f"""@echo off
+chcp 65001 > nul
+timeout /t 2 /nobreak > nul
+:wait
+tasklist /FI "IMAGENAME eq {current_exe.name}" 2>NUL | find /I "{current_exe.name}" >NUL
+if "%ERRORLEVEL%"=="0" (
+    timeout /t 1 /nobreak > nul
+    goto wait
+)
+move /Y "{new_exe}" "{current_exe}" > nul
+start "" "{current_exe}"
+del "%~f0" > nul
+"""
+        bat.write_text(content, encoding="cp1251", errors="ignore")
+        return bat
+    except Exception:
+        return None
 
