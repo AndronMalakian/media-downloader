@@ -27,6 +27,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare bundled FFmpeg and ffprobe
+        run: python prepare_ffmpeg.py
+
       - name: Build executable
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
@@ -34,6 +37,10 @@ jobs:
           --icon "icon.ico"
           --add-data "icon.ico;."
           --add-data "version.txt;."
+          --add-binary ".build-tools/ffmpeg/bin/ffmpeg.exe;ffmpeg/bin"
+          --add-binary ".build-tools/ffmpeg/bin/ffprobe.exe;ffmpeg/bin"
+          --add-data ".build-tools/ffmpeg/licenses;ffmpeg/licenses"
+          --add-data ".build-tools/ffmpeg/manifest.json;ffmpeg"
           --add-data "main.py;."
           --add-data "downloader.py;."
           --add-data "pot.py;."
@@ -43,7 +50,7 @@ jobs:
           --collect-all ttkbootstrap
           --collect-all yt_dlp
           --collect-all yt_dlp_ejs
-          --collect-all bgutil_ytdlp_pot_provider
+          --collect-all yt_dlp_plugins
           --hidden-import=yt_dlp_plugins.extractor.getpot_bgutil_http
           --hidden-import=yt_dlp_plugins.extractor.getpot_bgutil_script
           main.py

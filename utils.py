@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import requests
 
@@ -115,9 +115,15 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def ffmpeg_cache_dir() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share")
+    return base / "Media-Downloader" / "tools" / "ffmpeg"
+
+
 def _tool_candidates(tool: str) -> list[Path]:
     names = (f"{tool}.exe", tool)
-    roots = [Path.cwd(), app_dir()]
+    bundle = Path(getattr(sys, "_MEIPASS", app_dir()))
+    roots = [bundle, app_dir(), ffmpeg_cache_dir(), Path.cwd()]
     seen = set()
     out: list[Path] = []
     for root in roots:
@@ -143,6 +149,7 @@ def _which(name: str) -> str | None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=3,
+            creationflags=0x08000000 if os.name == "nt" else 0,
         )
         if result.returncode == 0:
             return found
@@ -152,13 +159,10 @@ def _which(name: str) -> str | None:
 
 
 def _find_tool(tool: str) -> str | None:
-    found = _which(f"{tool}.exe") or _which(tool)
-    if found:
-        return found
     for c in _tool_candidates(tool):
         if c.exists() and c.is_file():
-            return str(c)
-    return None
+            return str(c.resolve())
+    return _which(f"{tool}.exe") or _which(tool)
 
 
 def find_ffmpeg() -> str | None:
@@ -177,11 +181,13 @@ def get_ffmpeg_download() -> dict | None:
         data = r.json()
         for a in data.get("assets", []):
             name = a.get("name", "").lower()
-            if "essentials" in name and "win64" in name and name.endswith(".zip"):
+            if name == "ffmpeg-master-latest-win64-gpl.zip":
                 return {
                     "name": a["name"],
                     "url": a["browser_download_url"],
                     "size": a.get("size", 0),
+                    "digest": a.get("digest"),
+                    "release_url": data.get("html_url", ""),
                 }
     except Exception:
         pass
@@ -434,7 +440,7 @@ APP_EXE_NAME = "Media-Downloader.exe"
 def get_app_version() -> str:
     try:
         if getattr(sys, "frozen", False):
-            base = Path(sys.executable).parent
+            base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
         else:
             base = Path(__file__).parent
         vfile = base / "version.txt"
@@ -492,6 +498,7 @@ def is_newer_app_version(remote_tag: str, local_ver: str) -> bool:
 
 
 def download_file(url: str, dest: Path, timeout: int = 600) -> bool:
+    partial = dest.with_suffix(dest.suffix + ".part")
     try:
         import requests
 
@@ -499,13 +506,16 @@ def download_file(url: str, dest: Path, timeout: int = 600) -> bool:
         with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
             r.raise_for_status()
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
+            with open(partial, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
+        partial.replace(dest)
         return True
     except Exception:
         return False
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def create_updater_script(new_exe: Path, current_exe: Path) -> Optional[Path]:
@@ -524,7 +534,7 @@ move /Y "{new_exe}" "{current_exe}" > nul
 start "" "{current_exe}"
 del "%~f0" > nul
 """
-        bat.write_text(content, encoding="cp1251", errors="ignore")
+        bat.write_text(content, encoding="utf-8")
         return bat
     except Exception:
         return None

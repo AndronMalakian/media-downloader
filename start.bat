@@ -9,7 +9,12 @@ if not exist "venv\Scripts\pythonw.exe" (
     python -m venv venv || goto :fail
     call venv\Scripts\activate.bat
     pip install -q --upgrade pip
-    pip install -q -r requirements.txt || goto :fail
+)
+
+fc /b requirements.txt venv\requirements-installed.txt >nul 2>nul
+if errorlevel 1 (
+    "venv\Scripts\python.exe" -m pip install -q -r requirements.txt || goto :fail
+    copy /y requirements.txt venv\requirements-installed.txt >nul
 )
 
 start "" "venv\Scripts\pythonw.exe" main.py

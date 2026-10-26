@@ -1,4 +1,5 @@
 import os
+from copy import copy
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -21,7 +22,6 @@ CLIENT_FALLBACKS: list[list[str] | None] = [
     None,                          # чистые дефолты yt-dlp (без принудительного player_client)
     ["web"],                       # чаще работает для живых трансляций /live/
     ["visionos", "android_vr"],    # анонимные клиенты: часто без cookies и без PO Token
-    ["mweb", "tv"],                # запасные варианты (могут требовать PO Token)
 ]
 
 # Ошибки, при которых имеет смысл повторить с другим клиентом.
@@ -42,7 +42,7 @@ RETRYABLE_MARKERS = (
     "unable to connect",
 )
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = len(CLIENT_FALLBACKS)
 
 
 def build_runtime_opts(clients: list[str] | None = None, proxy: str | None = None) -> dict:
@@ -105,7 +105,7 @@ class MediaDownloader:
     def _emit(self):
         if self.progress_callback:
             try:
-                self.progress_callback(self.progress)
+                self.progress_callback(copy(self.progress))
             except Exception:
                 pass
 
@@ -137,6 +137,8 @@ class MediaDownloader:
         last_error = ""
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            if self._stop_event.is_set():
+                raise RuntimeError("Отменено")
             opts = dict(base_opts)
             ensure_pot_server()
             opts.update(build_runtime_opts(clients=CLIENT_FALLBACKS[attempt - 1], proxy=proxy))
@@ -197,16 +199,28 @@ class MediaDownloader:
         restrict_filenames: bool = True,
         download_archive: str | None = None,
     ):
-        self._stop_event.clear()
         self.progress = DownloadProgress()
         self._url = url
         self.progress.status = "extracting"
         self._emit()
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if self._stop_event.is_set():
+            self.progress.status = "cancelled"
+            self._emit()
+            return
 
-        limit = 60 if restrict_filenames else 0
-        outtmpl = str(output_dir / f"%(title).{limit}s [%(id)s].%(ext)s")
+        try:
+            if playlist_start < 1 or playlist_end < 0 or (playlist_end and playlist_end < playlist_start):
+                raise ValueError("Проверьте диапазон плейлиста: конец должен быть не меньше начала.")
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as e:
+            self.progress.status = "error"
+            self.progress.error = str(e)
+            self._emit()
+            return
+
+        title_template = "%(title).60s" if restrict_filenames else "%(title)s"
+        outtmpl = str(output_dir / f"{title_template} [%(id)s].%(ext)s")
 
         opts: Dict[str, Any] = {
             "quiet": True,
@@ -222,6 +236,7 @@ class MediaDownloader:
             "http_chunk_size": 1048576,
             "buffersize": 16777216,
             "socket_timeout": 30,
+            "windowsfilenames": os.name == "nt",
         }
 
         if cookies_file:
@@ -249,7 +264,7 @@ class MediaDownloader:
             opts["postprocessors"] = [pp, {"key": "FFmpegMetadata"}]
         elif mode == "video":
             # Только видео, без звуковой дорожки
-            opts["format"] = "bv*/b"
+            opts["format"] = "bv"
         elif mode == "custom":
             opts["format"] = custom_format or "bv*+ba/b"
         else:
@@ -281,7 +296,9 @@ class MediaDownloader:
                 try:
                     with YoutubeDL(attempt_opts) as ydl:
                         self._ydl = ydl
-                        ydl.download([url])
+                        result = ydl.download([url])
+                        if result:
+                            raise RuntimeError("Не все файлы удалось скачать. Проверьте доступность видео в плейлисте.")
                     if self._stop_event.is_set():
                         self.progress.status = "cancelled"
                     else:
