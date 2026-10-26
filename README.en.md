@@ -128,14 +128,11 @@ Enable **Settings → Download archive → Skip already downloaded** — the app
 
 ## 🧩 Requirements
 
-**FFmpeg is required** for 1080p+ quality and for converting to mp3/m4a/opus.
+**The ready-to-run `.exe` includes FFmpeg and ffprobe.** No separate installation or `PATH` configuration is needed. They merge video with audio and convert audio formats.
 
-The app looks for it in:
-- system `PATH`
-- `ffmpeg\ffmpeg.exe`
-- `ffmpeg\bin\ffmpeg.exe` (next to the app)
+When running from source, use **Settings → Restore FFmpeg**. Components are stored under `%LOCALAPPDATA%\Media-Downloader\tools\ffmpeg` without administrator permissions. System `PATH` and an adjacent `ffmpeg\bin` directory are also supported.
 
-If not found, use **Download automatically** on the **Settings** tab.
+`build_exe.bat` downloads and verifies FFmpeg before packaging. Component licenses and source information are bundled with the application.
 
 ## 🍪 Cookies
 

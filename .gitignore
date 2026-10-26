@@ -6,6 +6,8 @@ __pycache__/
 .eggs/
 build/
 dist/
+.build-tools/
+.ruff_cache/
 
 # Virtual environments
 venv/

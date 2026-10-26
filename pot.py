@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 PROVIDER_VERSION = "2.0.0"
@@ -22,6 +23,7 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # Процесс запущенного нами сервера, чтобы корректно остановить его при выходе
 _proc: "subprocess.Popen | None" = None
+_server_lock = threading.Lock()
 
 
 def app_root() -> Path:
@@ -230,6 +232,11 @@ def _find_npm() -> str | None:
 
 
 def start_server(log=None) -> bool:
+    with _server_lock:
+        return _start_server(log)
+
+
+def _start_server(log=None) -> bool:
     """Запускает PO Token сервер. Возвращает True, если он отвечает."""
     global _proc
     if server_running():
@@ -304,20 +311,19 @@ def _server_pids() -> list[str]:
 
 
 def stop_server() -> None:
-    if os.name != "nt":
-        return
-
-    pids = _server_pids()
-    if _proc is not None and _proc.poll() is not None:
-        pids = [str(_proc.pid)] if not pids else pids
-
-    for pid in pids:
+    global _proc
+    with _server_lock:
+        proc, _proc = _proc, None
+        if proc is None or proc.poll() is not None:
+            return
         try:
-            subprocess.run(
-                ["taskkill", "/PID", pid, "/T", "/F"],
-                capture_output=True,
-                timeout=20,
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW,
+                )
+            else:
+                proc.terminate()
+                proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()

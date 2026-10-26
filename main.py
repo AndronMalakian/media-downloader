@@ -1,19 +1,18 @@
 import json
+import queue
 import os
 import re
 import sys
+import subprocess
 import threading
-import time
-import zipfile
 from datetime import datetime
 from pathlib import Path
-import subprocess
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import ttkbootstrap as ttkb
-from ttkbootstrap.constants import BOTH, BOTTOM, HORIZONTAL, LEFT, RIGHT, VERTICAL, X, Y
+from ttkbootstrap.constants import BOTH, HORIZONTAL, LEFT, RIGHT, VERTICAL, X, Y
 
 try:
     from ttkbootstrap.tooltip import ToolTip
@@ -34,6 +33,7 @@ def resource_path(name: str) -> str:
     return os.path.join(base, name)
 
 from downloader import DownloadProgress, MediaDownloader
+from ffmpeg_tools import install_ffmpeg
 from pot import (
     SERVER_HOST,
     SERVER_PORT,
@@ -44,12 +44,12 @@ from pot import (
     start_server,
     stop_server,
 )
-import pot
 from utils import (
     browser_reads_ok,
     check_cookies_file,
     check_youtube_network,
     detect_browsers,
+    ffmpeg_cache_dir,
     find_ffmpeg,
     find_ffprobe,
     format_bytes,
@@ -58,7 +58,6 @@ from utils import (
     get_app_asset_url,
     get_app_version,
     get_default_download_dir,
-    get_ffmpeg_download,
     get_installed_ytdlp_version,
     get_latest_app_release,
     get_latest_pypi_version,
@@ -140,6 +139,14 @@ class VScroll(ttkb.Frame):
 class YTApp(ttkb.Window):
     def __init__(self):
         super().__init__(title="Media Downloader", size=(1000, 880), minsize=(900, 780))
+        self._ui_thread = threading.get_ident()
+        self._ui_events = queue.Queue()
+        self._closing = False
+        self._info_loading = False
+        self._info_downloader = None
+        self._updating = False
+        self._installing_ffmpeg = False
+        self.after(40, self._drain_ui_events)
         self._fit_to_screen()
         try:
             ico = resource_path("icon.ico")
@@ -157,24 +164,61 @@ class YTApp(ttkb.Window):
         self._build_ui()
         self._apply_config()
         self._ui_ready = True
-        self._save_config()
         self._restore_geometry()
         self._check_ffmpeg()
         self._refresh_browser_list()
         saved = getattr(self, "_saved_browser", "без cookies")
         if saved and saved != "без cookies" and browser_reads_ok(saved):
             for label, key in self._browser_by_label.items():
-                    if key == saved:
-                        self.cmb_browser.set(label)
-                        break
+                if key == saved:
+                    self.cmb_browser.set(label)
+                    break
         self._refresh_browser_status()
+        self.update_idletasks()
+        self._save_config()
         self._check_components()
         threading.Thread(target=self._autostart_pot, daemon=True).start()
         self._setup_shortcuts()
+        self.url_var.trace_add("write", self._on_url_change)
         self.bind("<FocusIn>", self._on_focus_in)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("Готово. Вставьте ссылку с YouTube и нажмите «Получить информацию»")
         self._check_updates_async()
+
+    def _post_ui(self, callback):
+        """Передаёт результат фоновой работы в основной поток Tk."""
+        if not self._closing:
+            self._ui_events.put(callback)
+
+    def _drain_ui_events(self):
+        if self._closing:
+            return
+        for _ in range(100):
+            try:
+                callback = self._ui_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        self.after(40, self._drain_ui_events)
+
+    def _playlist_range(self):
+        if self.playlist_all_var.get():
+            return 1, 0
+        try:
+            start, end = self.playlist_start_var.get(), self.playlist_end_var.get()
+            if start < 1 or end < 0 or (end and end < start):
+                raise ValueError
+        except (ValueError, tk.TclError):
+            raise ValueError("Укажите целые номера: начало от 1, конец не меньше начала или 0 — до конца.") from None
+        return start, end
+
+    def _on_url_change(self, *_args):
+        self._populate_formats({})
+        self.title_lbl.config(text="Название: —")
+        self.meta_lbl.config(text="Длительность: —    Канал: —")
 
     def _fit_to_screen(self):
         """Подгоняет окно под экран, чтобы нижние кнопки не уезжали за край."""
@@ -194,16 +238,16 @@ class YTApp(ttkb.Window):
         geo = (self.config.get("geometry") or "").strip()
         if not geo:
             return
-        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geo)
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geo)
         if not m:
             return
         try:
             w, h, x, y = (int(m.group(i)) for i in range(1, 5))
-            if w < 900 or h < 780:
-                return
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            x = max(-w + 120, min(x, sw - 120))
-            y = max(0, min(y, sh - 120))
+            w = min(max(w, 900), max(900, sw - 40))
+            h = min(max(h, 620), max(620, sh - 70))
+            x = max(0, min(x, sw - w))
+            y = max(0, min(y, sh - h - 40))
             self.minsize(900, min(780, h))
             self.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
@@ -213,9 +257,13 @@ class YTApp(ttkb.Window):
         for name in ("bootstrap-dark", "darkly", "cyborg", "superhero"):
             try:
                 self.style.theme_use(name)
-                return
+                break
             except Exception:
                 continue
+        self.option_add("*Font", "{Segoe UI} 10")
+        self.style.configure("Treeview", rowheight=28, font=("Segoe UI", 9))
+        self.style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9))
+        self.style.configure("TNotebook.Tab", padding=(18, 9))
 
     # ---------- config ----------
 
@@ -223,7 +271,8 @@ class YTApp(ttkb.Window):
         try:
             path = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
             if path.exists():
-                return json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
         except Exception:
             pass
         return {}
@@ -244,7 +293,9 @@ class YTApp(ttkb.Window):
                 "proxy": self.proxy_var.get().strip(),
                 "geometry": self.winfo_geometry(),
             }
-            CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            temporary = CONFIG_FILE.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(CONFIG_FILE)
         except Exception:
             pass
 
@@ -311,26 +362,28 @@ class YTApp(ttkb.Window):
     # ---------- ui ----------
 
     def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
         try:
             bg = self.style.lookup("TFrame", "background") or "#2b3035"
         except Exception:
             bg = "#2b3035"
 
         header = ttkb.Frame(self, padding=(20, 10, 20, 8))
-        header.pack(fill=X)
+        header.grid(row=0, column=0, sticky="ew")
         brand = ttkb.Frame(header)
         brand.pack(side=LEFT)
-        ttkb.Label(brand, text="Media Downloader", font=("Segoe UI Semibold", 16)).pack(side=LEFT)
+        ttkb.Label(brand, text="Media Downloader", font=("Segoe UI Semibold", 20)).pack(anchor="w")
         ttkb.Label(brand, text="видео · аудио · плейлисты", font=("Segoe UI", 9), bootstyle="secondary").pack(
-            side=LEFT, padx=(12, 0), pady=(6, 0)
+            anchor="w", pady=(2, 0)
         )
         self.ffmpeg_badge = ttkb.Label(header, text="FFmpeg: проверка...", font=("Segoe UI", 8), bootstyle="warning")
         self.ffmpeg_badge.pack(side=RIGHT)
 
-        ttkb.Separator(self).pack(fill=X, padx=20)
+        ttkb.Separator(self).grid(row=1, column=0, sticky="ew", padx=20)
 
         url_box = ttkb.LabelFrame(self, text=" Ссылка ", padding=(14, 10, 14, 10))
-        url_box.pack(fill=X, padx=20, pady=(10, 8))
+        url_box.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 8))
         row = ttkb.Frame(url_box)
         row.pack(fill=X)
         self.url_entry = ttkb.Entry(row, textvariable=self.url_var, font=("Segoe UI", 10))
@@ -338,7 +391,8 @@ class YTApp(ttkb.Window):
         self.url_entry.bind("<Return>", lambda e: self._get_info_async())
         ttkb.Button(row, text="Вставить", width=10, bootstyle="light-outline", command=self._paste_url).pack(side=LEFT, padx=(8, 0))
         ttkb.Button(row, text="Очистить", width=10, bootstyle="light-outline", command=self._clear_url).pack(side=LEFT, padx=(6, 0))
-        ttkb.Button(row, text="Получить информацию", width=20, bootstyle="primary", command=self._get_info_async).pack(side=LEFT, padx=(6, 0))
+        self.btn_info = ttkb.Button(row, text="Получить информацию", width=24, bootstyle="primary", command=self._get_info_async)
+        self.btn_info.pack(side=LEFT, padx=(6, 0))
 
         self.title_lbl = ttkb.Label(url_box, text="Название: —", font=("Segoe UI", 9, "bold"), wraplength=860, justify=LEFT)
         self.title_lbl.pack(anchor="w", fill=X, pady=(10, 0))
@@ -346,10 +400,14 @@ class YTApp(ttkb.Window):
         self.meta_lbl.pack(anchor="w", fill=X, pady=(2, 0))
 
         self.nb = nb = ttkb.Notebook(self, padding=(0, 2))
-        nb.pack(fill=X, padx=20)
+        nb.grid(row=3, column=0, sticky="nsew", padx=20)
 
-        tab_fmt = ttkb.Frame(nb, padding=(16, 8, 16, 8))
+        tab_fmt = ttkb.Frame(nb)
         nb.add(tab_fmt, text="Формат")
+        fmt_scroll = VScroll(tab_fmt, height=260, bg=bg)
+        fmt_scroll.pack(fill=BOTH, expand=True)
+        tab_fmt = ttkb.Frame(fmt_scroll.inner, padding=(16, 8, 16, 8))
+        tab_fmt.pack(fill=BOTH, expand=True)
         fbox = ttkb.LabelFrame(tab_fmt, text=" Что скачивать ", padding=(14, 8, 14, 8))
         fbox.pack(fill=X)
         self.rb_best = ttkb.Radiobutton(fbox, text="Лучшее качество — видео + аудио (MP4)", variable=self.format_var, value="best", command=self._on_mode_change)
@@ -367,7 +425,7 @@ class YTApp(ttkb.Window):
         ttkb.Label(arow, text="Формат:", width=10).pack(side=LEFT)
         self.cmb_af = ttkb.Combobox(arow, values=["mp3", "m4a", "opus", "wav"], textvariable=self.audio_format_var, state="readonly", width=10)
         self.cmb_af.pack(side=LEFT, padx=(5, 0))
-        self.cmb_af.bind("<<ComboboxSelected>>", lambda e: self._save_config())
+        self.cmb_af.bind("<<ComboboxSelected>>", lambda e: self._update_state())
         ttkb.Label(arow, text="Битрейт:", width=12).pack(side=LEFT, padx=(18, 0))
         self.cmb_aq = ttkb.Combobox(arow, values=["128", "160", "192", "256", "320"], textvariable=self.audio_quality_var, state="readonly", width=8)
         self.cmb_aq.pack(side=LEFT, padx=(5, 0))
@@ -377,10 +435,10 @@ class YTApp(ttkb.Window):
             anchor="w", pady=(6, 0)
         )
 
-        tblbox = ttkb.LabelFrame(tab_fmt, text=" Конкретный формат — выберите строку (появится после «Получить информацию») ", padding=(10, 6, 10, 6))
+        tblbox = ttkb.LabelFrame(tab_fmt, text=" Доступные форматы ", padding=(10, 6, 10, 6))
         tblbox.pack(fill=BOTH, expand=True, pady=(6, 0))
         cols = ("quality", "type", "codec", "fps", "size", "note")
-        self.fmt_tree = ttkb.Treeview(tblbox, columns=cols, show="headings", height=5, bootstyle="light")
+        self.fmt_tree = ttkb.Treeview(tblbox, columns=cols, show="headings", selectmode="browse", height=5, bootstyle="light")
         for cid, text, w, anchor in (
             ("quality", "Качество", 110, "w"),
             ("type", "Тип", 110, "w"),
@@ -399,8 +457,12 @@ class YTApp(ttkb.Window):
         self.fmt_lbl = ttkb.Label(tab_fmt, text="Формат не выбран — используется выбор выше.", bootstyle="secondary", font=("Segoe UI", 8))
         self.fmt_lbl.pack(anchor="w", pady=(4, 0))
 
-        tab_q = ttkb.Frame(nb, padding=(16, 8, 16, 8))
+        tab_q = ttkb.Frame(nb)
         nb.add(tab_q, text="Очередь")
+        queue_scroll = VScroll(tab_q, height=260, bg=bg)
+        queue_scroll.pack(fill=BOTH, expand=True)
+        tab_q = ttkb.Frame(queue_scroll.inner, padding=(16, 8, 16, 8))
+        tab_q.pack(fill=BOTH, expand=True)
 
         qin = ttkb.LabelFrame(tab_q, text=" Ссылки — по одной в строке ", padding=(12, 8, 12, 8))
         qin.pack(fill=X)
@@ -541,7 +603,7 @@ class YTApp(ttkb.Window):
             width=16,
         )
         self.cmb_browser.pack(side=LEFT, padx=(5, 0))
-        self.cmb_browser.bind("<<ComboboxSelected>>", lambda e: self._refresh_browser_status())
+        self.cmb_browser.bind("<<ComboboxSelected>>", lambda e: (self._refresh_browser_status(), self._save_config()))
         ttkb.Button(brow, text="Обновить", width=12, bootstyle="light-outline", command=self._refresh_browser_list).pack(side=LEFT, padx=(8, 0))
         ttkb.Button(brow, text="Сбросить", width=12, bootstyle="light-outline", command=self._reset_browser).pack(side=LEFT, padx=(6, 0))
         self.browser_status = ttkb.Label(
@@ -569,12 +631,14 @@ class YTApp(ttkb.Window):
         frow = ttkb.Frame(fbox2)
         frow.pack(fill=X, pady=(8, 0))
         ttkb.Button(frow, text="Проверить", width=13, bootstyle="light-outline", command=self._check_ffmpeg).pack(side=LEFT)
-        ttkb.Button(frow, text="Скачать автоматически", width=24, bootstyle="light-outline", command=self._download_ffmpeg_async).pack(side=LEFT, padx=(8, 0))
+        self.btn_ffmpeg = ttkb.Button(frow, text="Восстановить FFmpeg", width=24, bootstyle="light-outline", command=self._download_ffmpeg_async)
+        self.btn_ffmpeg.pack(side=LEFT, padx=(8, 0))
         ttkb.Label(
             fbox2,
-            text="Обязателен для склейки видео+аудио (1080p и выше) и конвертации в MP3/M4A/Opus.",
+            text="Включён в готовое приложение. Объединяет видео со звуком и конвертирует аудио. Восстановление не требует прав администратора.",
             bootstyle="secondary",
             font=("Segoe UI", 8),
+            wraplength=820,
         ).pack(anchor="w", pady=(8, 0))
 
         kbox = ttkb.LabelFrame(tab_set, text="Компоненты для работы с YouTube", padding=(14, 10, 14, 10))
@@ -660,7 +724,7 @@ class YTApp(ttkb.Window):
         ).pack(anchor="w", pady=(8, 0))
 
         pbox2 = ttkb.LabelFrame(self, text=" Прогресс ", padding=(16, 8, 16, 8))
-        pbox2.pack(fill=X, padx=20, pady=(8, 0))
+        pbox2.grid(row=4, column=0, sticky="ew", padx=20, pady=(8, 0))
         self.progress_bar = ttkb.Progressbar(pbox2, orient=HORIZONTAL, mode="determinate", maximum=100, value=0)
         self.progress_bar.pack(fill=X)
         irow = ttkb.Frame(pbox2)
@@ -677,7 +741,7 @@ class YTApp(ttkb.Window):
 
         # Нижняя панель цепляется к низу окна и никогда не уезжает за экран
         arow2 = ttkb.Frame(self, padding=(20, 8, 20, 12))
-        arow2.pack(side=BOTTOM, fill=X)
+        arow2.grid(row=6, column=0, sticky="ew")
         self.btn_download = ttkb.Button(arow2, text="Скачать", width=16, bootstyle="success", command=self._download_async)
         self.btn_download.pack(side=LEFT)
         self.btn_stop = ttkb.Button(arow2, text="Остановить", width=16, bootstyle="danger", command=self._stop_download, state="disabled")
@@ -688,8 +752,8 @@ class YTApp(ttkb.Window):
         self.ytdlp_lbl.pack(side=RIGHT, padx=(10, 0))
 
         lbox = ttkb.LabelFrame(self, text=" Журнал ", padding=(12, 8, 12, 8))
-        lbox.pack(fill=BOTH, expand=True, padx=20, pady=(10, 10))
-        self.log_text = tk.Text(lbox, height=6, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", borderwidth=0, padx=10, pady=8, relief="flat")
+        lbox.grid(row=5, column=0, sticky="ew", padx=20, pady=(10, 0))
+        self.log_text = tk.Text(lbox, height=4, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", borderwidth=0, padx=10, pady=8, relief="flat")
         self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
         sb = ttkb.Scrollbar(lbox, orient=VERTICAL, command=self.log_text.yview)
         sb.pack(side=RIGHT, fill=Y)
@@ -701,6 +765,9 @@ class YTApp(ttkb.Window):
         state = "disabled" if self.playlist_all_var.get() else "normal"
         self.sp_start.configure(state=state)
         self.sp_end.configure(state=state)
+        audio = self.format_var.get() == "bestaudio" and not self._selected_format
+        self.cmb_af.configure(state="readonly" if audio else "disabled")
+        self.cmb_aq.configure(state="readonly" if audio and self.audio_format_var.get() != "wav" else "disabled")
         self._save_config()
 
     # ---------- форматы ----------
@@ -752,6 +819,7 @@ class YTApp(ttkb.Window):
         self._selected_label = ""
 
         if not info:
+            self._update_state()
             self.fmt_lbl.config(text="Формат не выбран — используется выбор выше.", bootstyle="secondary")
             return
 
@@ -827,6 +895,7 @@ class YTApp(ttkb.Window):
             bootstyle="success",
         )
         self._log(f"Выбран формат: {self._selected_label} [{self._selected_format}]")
+        self._update_state()
 
     # ---------- очередь ----------
 
@@ -841,6 +910,9 @@ class YTApp(ttkb.Window):
         self.queue_input.insert("end", ("\n" if cur else "") + text)
 
     def _queue_add(self):
+        if self._q_running:
+            messagebox.showinfo("Очередь", "Дождитесь завершения очереди или остановите её.")
+            return
         lines = [l.strip() for l in self.queue_input.get("1.0", "end").splitlines() if l.strip()]
         if not lines:
             messagebox.showinfo("Очередь", "Вставьте хотя бы одну ссылку.")
@@ -868,6 +940,20 @@ class YTApp(ttkb.Window):
         self._log(f"Из файла добавлено ссылок: {added}")
 
     def _queue_append(self, url: str) -> bool:
+        if self._q_running:
+            self._log("Сначала дождитесь завершения очереди или остановите её.")
+            return False
+        if not looks_like_url(url):
+            self._log(f"Пропущена некорректная ссылка: {url[:90]}")
+            return False
+        if any(it["url"] == url for it in self.queue_items):
+            self._log(f"Ссылка уже в очереди: {url[:90]}")
+            return False
+        try:
+            start, end = self._playlist_range()
+        except ValueError as e:
+            messagebox.showwarning("Диапазон плейлиста", str(e))
+            return False
         mode, custom_format, audio_only = self._current_mode()
         if custom_format:
             label = self._selected_label or "формат"
@@ -887,8 +973,8 @@ class YTApp(ttkb.Window):
             "audio_only": audio_only,
             "audio_format": self.audio_format_var.get(),
             "audio_quality": self.audio_quality_var.get(),
-            "start": max(1, self.playlist_start_var.get() or 1),
-            "end": 0 if self.playlist_all_var.get() else max(0, self.playlist_end_var.get() or 0),
+            "start": start,
+            "end": end,
             "fmt_label": label,
             "iid": iid,
         })
@@ -919,7 +1005,7 @@ class YTApp(ttkb.Window):
             pass
 
     def _queue_post(self, item: dict):
-        self.after(0, lambda it=item: self._queue_update_row(it))
+        self._post_ui(lambda it=item: self._queue_update_row(it))
 
     def _queue_renumber(self):
         for i, it in enumerate(self.queue_items, 1):
@@ -961,7 +1047,14 @@ class YTApp(ttkb.Window):
         return None
 
     def _queue_start(self):
-        if self._q_running:
+        if self._q_running or self._updating:
+            return
+        try:
+            n = self.q_parallel_var.get()
+            if not 1 <= n <= 4:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Очередь", "Число одновременных загрузок должно быть от 1 до 4.")
             return
         pending = [it for it in self.queue_items if it["status"] in ("ожидание", "ошибка", "отмена")]
         if not pending:
@@ -970,10 +1063,19 @@ class YTApp(ttkb.Window):
         if not self._check_browsers_before_download():
             return
         self._q_stop.clear()
+        self._save_config()
         self._q_running = True
         self._q_done_count = 0
         self._q_error_count = 0
         for it in pending:
+            it["options"] = dict(
+                output_dir=Path(self.output_dir_var.get() or str(get_default_download_dir())),
+                cookies_file=self.cookies_path,
+                cookies_from_browser=self._active_browser(),
+                proxy=self.proxy_var.get().strip() or None,
+                restrict_filenames=self.restrict_names_var.get(),
+                download_archive=self.archive_var.get().strip() if self.skip_downloaded_var.get() else None,
+            )
             it["status"] = "ожидание"
             it["percent"] = 0.0
             it["error"] = ""
@@ -982,9 +1084,11 @@ class YTApp(ttkb.Window):
         self.btn_q_stop.configure(state="normal")
         self.status_var.set("Очередь: загрузка...")
         self._log(f"Запускаю очередь из {len(pending)} ссылок (потоков: {max(1, int(self.q_parallel_var.get()))})")
-        n = max(1, min(4, int(self.q_parallel_var.get())))
+        self._q_threads = []
         for _ in range(n):
-            threading.Thread(target=self._queue_worker, daemon=True).start()
+            worker = threading.Thread(target=self._queue_worker, daemon=True)
+            self._q_threads.append(worker)
+            worker.start()
         threading.Thread(target=self._queue_watch, daemon=True).start()
 
     def _queue_worker(self):
@@ -997,7 +1101,7 @@ class YTApp(ttkb.Window):
     def _queue_download_item(self, item: dict):
         item["status"] = "инфо"
         self._queue_post(item)
-        out_dir = Path(self.output_dir_var.get() or str(get_default_download_dir()))
+        out_dir = item["options"]["output_dir"]
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -1006,13 +1110,14 @@ class YTApp(ttkb.Window):
             self._queue_post(item)
             return
 
-        dl = MediaDownloader(progress_callback=lambda p: self.after(0, lambda pp=p: self._queue_on_progress(item, pp)))
+        dl = MediaDownloader(progress_callback=lambda p: self._post_ui(lambda pp=p: self._queue_on_progress(item, pp)))
         with self._q_lock:
             self._q_active[id(item)] = dl
         try:
+            if self._q_stop.is_set():
+                dl.stop()
             dl.download(
                 url=item["url"],
-                output_dir=out_dir,
                 mode=item["mode"],
                 custom_format=item["custom_format"],
                 custom_audio_only=item["audio_only"],
@@ -1020,11 +1125,7 @@ class YTApp(ttkb.Window):
                 audio_quality=item["audio_quality"],
                 playlist_start=item["start"],
                 playlist_end=item["end"],
-                cookies_file=self.cookies_path,
-                cookies_from_browser=self._active_browser(),
-                proxy=self.proxy_var.get().strip() or None,
-                restrict_filenames=self.restrict_names_var.get(),
-                download_archive=self.archive_var.get().strip() if self.skip_downloaded_var.get() else None,
+                **item["options"],
             )
             prog = dl.progress
             if prog.status == "done":
@@ -1047,6 +1148,8 @@ class YTApp(ttkb.Window):
             self._queue_post(item)
 
     def _queue_on_progress(self, item: dict, p: DownloadProgress):
+        if item["status"] in ("готово", "ошибка", "отмена"):
+            return
         item["percent"] = p.percent
         if p.filename:
             item["title"] = Path(p.filename).name
@@ -1059,14 +1162,9 @@ class YTApp(ttkb.Window):
         self._queue_update_row(item)
 
     def _queue_watch(self):
-        while self._q_running:
-            with self._q_lock:
-                active = len(self._q_active)
-            remaining = any(it["status"] in ("ожидание", "старт", "загрузка", "инфо", "склейка") for it in self.queue_items)
-            if active == 0 and not remaining:
-                break
-            time.sleep(0.3)
-        self.after(0, self._queue_finish)
+        for worker in self._q_threads:
+            worker.join()
+        self._post_ui(self._queue_finish)
 
     def _queue_finish(self):
         self._q_running = False
@@ -1079,6 +1177,9 @@ class YTApp(ttkb.Window):
         err = sum(1 for it in self.queue_items if it["status"] == "ошибка")
         cancelled = sum(1 for it in self.queue_items if it["status"] == "отмена")
         self._log(f"Очередь завершена: готово {done}, ошибок {err}, отменено {cancelled}")
+        for item in self.queue_items:
+            if item["status"] == "ошибка":
+                self._log(f"Ошибка: {item['url']} — {item.get('error', 'Неизвестная ошибка')}")
         self.status_var.set(f"Очередь: готово {done}, ошибок {err}")
 
     def _queue_stop(self):
@@ -1091,7 +1192,7 @@ class YTApp(ttkb.Window):
             for it in self.queue_items:
                 if it["status"] in ("ожидание", "старт"):
                     it["status"] = "отмена"
-                    self.after(0, lambda i=it: self._queue_update_row(i))
+                    self._post_ui(lambda i=it: self._queue_update_row(i))
         for dl in actives:
             try:
                 dl.stop()
@@ -1102,9 +1203,14 @@ class YTApp(ttkb.Window):
     # ---------- log ----------
 
     def _log(self, msg: str):
+        if threading.get_ident() != self._ui_thread:
+            self._post_ui(lambda: self._log(msg))
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
         self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
+        if int(self.log_text.index("end-1c").split(".")[0]) > 1500:
+            self.log_text.delete("1.0", "250.0")
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
@@ -1126,6 +1232,8 @@ class YTApp(ttkb.Window):
             self._log(f"Ссылка вставлена: {text[:70]}")
 
     def _clear_url(self):
+        if self.is_downloading or self._info_loading:
+            return
         self.url_var.set("")
         self.title_lbl.config(text="Название: —")
         self.meta_lbl.config(text="Длительность: — | Канал: —")
@@ -1216,12 +1324,14 @@ class YTApp(ttkb.Window):
             url = get_app_asset_url(rel)
             if not url:
                 return
-            self.after(0, lambda t=tag,u=url: self._prompt_app_update(t, u))
+            self._post_ui(lambda t=tag,u=url: self._prompt_app_update(t, u))
         except Exception:
             pass
 
     def _prompt_app_update(self, tag: str, url: str):
-        if getattr(self, "is_downloading", False):
+        if self._closing or self._updating:
+            return
+        if self.is_downloading or self._q_running or self._info_loading:
             self.after(60000, lambda t=tag,u=url: self._prompt_app_update(t, u))
             return
         if not messagebox.askyesno(
@@ -1232,53 +1342,68 @@ class YTApp(ttkb.Window):
         self._do_app_update(url)
 
     def _do_app_update(self, url: str):
+        if self._updating:
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("Обновление", "Обновление exe доступно только в собранном .exe")
+            return
+        self._updating = True
+        self.btn_download.configure(state="disabled")
+        self.btn_q_start.configure(state="disabled")
+        self.btn_info.configure(state="disabled")
+        self.status_var.set("Скачиваю обновление программы…")
+        threading.Thread(target=self._app_update_worker, args=(url,), daemon=True).start()
+
+    def _app_update_worker(self, url: str):
         try:
-            if getattr(sys, "frozen", False):
-                exe = Path(sys.executable)
-                new_exe = exe.with_name("Media-Downloader.new.exe")
-            else:
-                messagebox.showinfo("Обновление", "Обновление exe доступно только в собранном .exe")
-                return
+            exe = Path(sys.executable)
+            new_exe = exe.with_name("Media-Downloader.new.exe")
             self._log("Скачиваю обновление...")
             if not download_file(url, new_exe):
-                messagebox.showerror("Обновление", "Не удалось скачать обновление")
-                return
+                raise RuntimeError("Не удалось скачать обновление")
             bat = create_updater_script(new_exe, exe)
             if not bat:
-                messagebox.showerror("Обновление", "Не удалось создать скрипт обновления")
-                return
+                raise RuntimeError("Не удалось создать скрипт обновления")
             self._log("Запускаю установщик обновления...")
-            subprocess.Popen(["cmd", "/c", str(bat)], shell=False)
+            self._post_ui(lambda: self._apply_app_update(bat))
+        except Exception as e:
+            self._post_ui(lambda err=str(e): self._app_update_failed(err))
+
+    def _apply_app_update(self, bat):
+        try:
+            subprocess.Popen(["cmd", "/c", str(bat)], shell=False, creationflags=_CREATE_NO_WINDOW)
             self._on_close()
         except Exception as e:
-            messagebox.showerror("Обновление", f"Ошибка: {e}")
+            self._app_update_failed(str(e))
+
+    def _app_update_failed(self, error):
+        self._updating = False
+        self.btn_download.configure(state="normal")
+        self.btn_q_start.configure(state="normal")
+        self.btn_info.configure(state="normal")
+        self.status_var.set("Не удалось обновить программу")
+        messagebox.showerror("Обновление", error)
 
     def _check_updates(self):
         current = get_installed_ytdlp_version()
-        self.after(0, lambda: self._set_ytdlp_bottom(current))
+        self._post_ui(lambda: self._set_ytdlp_bottom(current))
         latest = get_latest_pypi_version("yt-dlp")
         if not latest:
-            self.after(
-                0,
-                lambda: self.ytdlp_lbl2.config(
+            self._post_ui(lambda: self.ytdlp_lbl2.config(
                     text=f"yt-dlp: установлена {current or '?'}. Не удалось проверить обновления (нет сети).",
                     bootstyle="warning",
                 ),
             )
             return
         if is_newer_version(latest, current):
-            self.after(
-                0,
-                lambda: self.ytdlp_lbl2.config(
+            self._post_ui(lambda: self.ytdlp_lbl2.config(
                     text=f"yt-dlp: установлена {current} — доступна новая версия {latest}.",
                     bootstyle="warning",
                 ),
             )
-            self.after(0, lambda: self._log(f"Доступно обновление yt-dlp: {current} → {latest}"))
+            self._post_ui(lambda: self._log(f"Доступно обновление yt-dlp: {current} → {latest}"))
         else:
-            self.after(
-                0,
-                lambda: self.ytdlp_lbl2.config(
+            self._post_ui(lambda: self.ytdlp_lbl2.config(
                     text=f"yt-dlp: установлена {current} — это последняя версия.", bootstyle="success"
                 ),
             )
@@ -1290,6 +1415,8 @@ class YTApp(ttkb.Window):
             pass
 
     def _update_ytdlp_async(self):
+        if self._updating:
+            return
         if ytdlp_update_command() is None:
             if messagebox.askyesno(
                 "Обновление yt-dlp",
@@ -1300,26 +1427,35 @@ class YTApp(ttkb.Window):
 
                 webbrowser.open(RELEASES_URL)
             return
-        if self.is_downloading:
+        if self.is_downloading or self._q_running or self._info_loading:
             messagebox.showinfo("Обновление yt-dlp", "Сначала дождитесь окончания загрузки.")
             return
+        self._updating = True
+        self.btn_download.configure(state="disabled")
+        self.btn_q_start.configure(state="disabled")
+        self.btn_info.configure(state="disabled")
         threading.Thread(target=self._update_ytdlp, daemon=True).start()
 
     def _update_ytdlp(self):
-        self.after(0, lambda: self._log("Обновляю yt-dlp..."))
+        self._post_ui(lambda: self._log("Обновляю yt-dlp..."))
         cmd = ytdlp_update_command()
         code, out = _run_process(cmd, timeout=900) if cmd else (1, "обновление недоступно")
         if code == 0:
-            self.after(0, lambda: self._log("yt-dlp обновлён. Перезапустите программу, чтобы применить."))
-            self.after(
-                0,
-                lambda: messagebox.showinfo("yt-dlp", "yt-dlp обновлён.\n\nПерезапустите программу для применения."),
+            self._post_ui(lambda: self._log("yt-dlp обновлён. Перезапустите программу, чтобы применить."))
+            self._post_ui(lambda: messagebox.showinfo("yt-dlp", "yt-dlp обновлён.\n\nПерезапустите программу для применения."),
             )
         else:
             tail = (out or "").strip()[-500:]
-            self.after(0, lambda: self._log(f"Не удалось обновить yt-dlp:\n{tail}"))
-            self.after(0, lambda: messagebox.showerror("yt-dlp", "Не удалось обновить yt-dlp. Подробности в журнале."))
-        self.after(0, self._check_updates_async)
+            self._post_ui(lambda: self._log(f"Не удалось обновить yt-dlp:\n{tail}"))
+            self._post_ui(lambda: messagebox.showerror("yt-dlp", "Не удалось обновить yt-dlp. Подробности в журнале."))
+        self._post_ui(self._check_updates_async)
+        self._post_ui(self._finish_dependency_update)
+
+    def _finish_dependency_update(self):
+        self._updating = False
+        self.btn_download.configure(state="normal")
+        self.btn_q_start.configure(state="normal")
+        self.btn_info.configure(state="normal")
 
     def _load_cookies(self):
         chosen = filedialog.askopenfilename(title="Выберите cookies.txt", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -1352,12 +1488,6 @@ class YTApp(ttkb.Window):
         self._refresh_browser_status()
         self._save_config()
 
-    def _active_browser(self) -> str | None:
-        value = self.browser_var.get()
-        if not value or value == "без cookies":
-            return None
-        return value
-
     def _refresh_browser_list(self):
         self._detected = detect_browsers()
         self._browser_by_label = {"без cookies": None}
@@ -1381,14 +1511,13 @@ class YTApp(ttkb.Window):
         usable = [n for n, _ in self._detected if browser_reads_ok(n)]
         if usable:
             self._log(f"Браузеры, из которых можно читать cookies: {', '.join(usable)}")
-        else:
-            self._log("Ни один браузер нельзя читать напрямую (защита 127+) — нужен cookies.txt")
+        elif self._detected:
+            self._log("Для найденных браузеров нужен экспорт cookies.txt. Публичные видео можно скачивать без cookies.")
 
     def _active_browser(self) -> str | None:
         return self._browser_by_label.get(self.browser_var.get())
 
     def _refresh_browser_status(self):
-        label = self.browser_var.get()
         browser = self._active_browser()
         blocked = [n for n, _ in self._detected if not browser_reads_ok(n)]
 
@@ -1457,14 +1586,14 @@ class YTApp(ttkb.Window):
         elif ffmpeg:
             self.ffmpeg_badge.config(text="FFmpeg: неполный", bootstyle="warning")
             self.ffmpeg_lbl.config(
-                text=f"Найден только ffmpeg ({ffmpeg}), нет ffprobe. Склейка видео+аудио работать не будет — нажмите «Скачать автоматически».",
+                text="Набор компонентов неполный. Нажмите «Восстановить FFmpeg», чтобы установить недостающие файлы.",
                 bootstyle="warning",
             )
-            self._log("FFmpeg найден, но нет ffprobe — склейка видео не сработает")
+            self._log("Найден FFmpeg, но отсутствует ffprobe. Доступно восстановление в настройках.")
         else:
             self.ffmpeg_badge.config(text="FFmpeg: не найден", bootstyle="danger")
-            self.ffmpeg_lbl.config(text="FFmpeg не найден. Ищите в PATH или в папке ffmpeg/bin/ffmpeg.exe", bootstyle="danger")
-            self._log("FFmpeg не найден — качества 1080p+ и MP3 могут не работать")
+            self.ffmpeg_lbl.config(text="Компоненты обработки видео отсутствуют. Нажмите «Восстановить FFmpeg».", bootstyle="danger")
+            self._log("Для объединения видео со звуком и конвертации аудио восстановите FFmpeg в настройках.")
 
     def _check_components(self):
         deno = find_deno()
@@ -1494,20 +1623,20 @@ class YTApp(ttkb.Window):
         try:
             res = check_youtube_network()
         except Exception as e:
-            self.after(0, lambda: self.net_lbl.config(text=f"Ошибка проверки: {e}", bootstyle="danger"))
+            self._post_ui(lambda err=str(e): self.net_lbl.config(text=f"Ошибка проверки: {err}", bootstyle="danger"))
             return
         state = res.get("state")
         detail = res.get("detail", "")
         style = {"ok": "success", "blocked": "danger"}.get(state, "warning")
-        self.after(0, lambda: self.net_lbl.config(text=detail, bootstyle=style))
+        self._post_ui(lambda: self.net_lbl.config(text=detail, bootstyle=style))
 
     def _autostart_pot(self):
         """Тихо поднимает PO Token сервер, если провайдер уже установлен."""
         if not provider_installed() or server_running():
             return
-        self.after(0, lambda: self._log("Запускаю PO Token сервер..."))
-        if start_server(log=lambda m: self.after(0, lambda msg=m: self._log(msg))):
-            self.after(0, self._check_components)
+        self._post_ui(lambda: self._log("Запускаю PO Token сервер..."))
+        if start_server(log=lambda m: self._post_ui(lambda msg=m: self._log(msg))):
+            self._post_ui(self._check_components)
 
     def _ensure_pot_server(self) -> bool:
         if server_running():
@@ -1530,7 +1659,7 @@ class YTApp(ttkb.Window):
                 self._log("Deno установлен.")
             else:
                 self._log("winget не смог поставить Deno. Скачайте вручную: https://deno.com")
-            self.after(0, self._check_components)
+            self._post_ui(self._check_components)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1545,150 +1674,105 @@ class YTApp(ttkb.Window):
                     self._log("Готово — PO Token работает.")
                 else:
                     self._log("Сервер не поднялся, проверьте журнал.")
-                self.after(0, lambda: messagebox.showinfo("PO Token", "PO Token провайдер установлен и запущен."))
+                self._post_ui(lambda: messagebox.showinfo("PO Token", "PO Token провайдер установлен. Статус запуска указан в журнале."))
             else:
                 self._log(f"Ошибка установки: {msg}")
-                self.after(0, lambda: messagebox.showerror("PO Token", f"Не удалось установить:\n\n{msg}"))
-            self.after(0, self._check_components)
+                self._post_ui(lambda: messagebox.showerror("PO Token", f"Не удалось установить:\n\n{msg}"))
+            self._post_ui(self._check_components)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _download_ffmpeg_async(self):
+        if self._installing_ffmpeg:
+            return
+        if self.is_downloading or self._q_running:
+            messagebox.showinfo("FFmpeg", "Дождитесь окончания загрузок перед восстановлением компонентов.")
+            return
+        self._installing_ffmpeg = True
+        self.btn_ffmpeg.configure(state="disabled")
         threading.Thread(target=self._download_ffmpeg, daemon=True).start()
 
     @staticmethod
     def _ffmpeg_root() -> Path:
-        if getattr(sys, "frozen", False):
-            return Path(sys.executable).resolve().parent / "ffmpeg"
-        return Path.cwd() / "ffmpeg"
+        return ffmpeg_cache_dir()
 
     def _download_ffmpeg(self):
-        self._log("Ищу последнюю сборку FFmpeg...")
-        info = get_ffmpeg_download()
-        if not info:
-            self._log("Не удалось получить ссылку на FFmpeg — открываю страницу вручную")
-            messagebox.showwarning("FFmpeg", f"Автозагрузка не удалась.\n\nСкачайте «essentials build win64» со страницы:\n{FFMPEG_URL}\n\nЗатем распакуйте ffmpeg.exe в папку ffmpeg/bin/ рядом с программой.")
-            import webbrowser
-
-            webbrowser.open(FFMPEG_URL)
-            return
-
-        import shutil
-        import tempfile
-
-        import requests
-
-        url = info["url"]
-        self._log(f"Найдено: {info['name']} ({format_bytes(info['size'])})")
-        fd, zpath = tempfile.mkstemp(suffix=".zip")
-        os.close(fd)
         try:
-            with requests.get(url, stream=True, timeout=600, headers={"User-Agent": "Media-Downloader"}) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("content-length", 0))
-                done = 0
-                with open(zpath, "wb") as f:
-                    for chunk in r.iter_content(1 << 20):
-                        if chunk:
-                            f.write(chunk)
-                            done += len(chunk)
-                            if total:
-                                self._log(f"Загружено FFmpeg: {int(done / total * 100)}%")
-
-            self._log("Распаковываю...")
-            ffmpeg_dir = self._ffmpeg_root()
-            with zipfile.ZipFile(zpath) as z:
-                z.extractall(ffmpeg_dir)
-
-            extracted = {}
-            for root, _dirs, files in os.walk(ffmpeg_dir):
-                for name in files:
-                    if name in ("ffmpeg.exe", "ffprobe.exe"):
-                        extracted[name] = Path(root) / name
-
-            if "ffmpeg.exe" not in extracted:
-                raise RuntimeError("ffmpeg.exe не найден после распаковки")
-
-            target_dir = ffmpeg_dir / "bin"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for name, source in extracted.items():
-                target = target_dir / name
-                if source.resolve() == target.resolve():
-                    continue
-                try:
-                    os.replace(source, target)
-                except OSError:
-                    shutil.move(str(source), str(target))
-
-            missing = [n for n in ("ffmpeg.exe", "ffprobe.exe") if n not in extracted]
-            self._log(f"FFmpeg установлен в {target_dir}")
-            if missing:
-                self._log(f"Внимание: не найден {', '.join(missing)} — склейка видео может не работать")
-            messagebox.showinfo("FFmpeg", f"FFmpeg скачан и установлен.\n\n{target_dir}")
+            target = install_ffmpeg(self._ffmpeg_root(), log=self._log)
+            self._post_ui(lambda: messagebox.showinfo("FFmpeg", f"Компоненты обработки видео установлены.\n\n{target}"))
         except Exception as e:
-            self._log(f"Ошибка загрузки FFmpeg: {e}")
-            messagebox.showerror("FFmpeg", f"Не удалось скачать FFmpeg:\n{e}\n\nСкачайте вручную: {FFMPEG_URL}")
+            self._log(f"FFmpeg: {e}")
+            self._post_ui(lambda err=str(e): messagebox.showerror("FFmpeg", err))
         finally:
-            try:
-                os.unlink(zpath)
-            except OSError:
-                pass
-            self._check_ffmpeg()
+            self._post_ui(self._finish_ffmpeg_install)
+
+    def _finish_ffmpeg_install(self):
+        self._installing_ffmpeg = False
+        self.btn_ffmpeg.configure(state="normal")
+        self._check_ffmpeg()
 
     # ---------- info ----------
 
     def _get_info_async(self):
+        if self._info_loading or self._updating:
+            return
         url = self.url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Ссылка", "Вставьте ссылку на YouTube")
+        if not looks_like_url(url):
+            messagebox.showwarning("Ссылка", "Вставьте корректную ссылку на видео или плейлист.")
             return
         if not self._check_browsers_before_download():
             return
         self._refresh_browser_status()
-        threading.Thread(target=self._get_info, args=(url,), daemon=True).start()
+        self._info_loading = True
+        self.btn_info.configure(state="disabled", text="Получаю информацию…")
+        self.title_lbl.config(text="Название: загружаю…")
+        self._populate_formats({})
+        options = dict(cookies_file=self.cookies_path, cookies_from_browser=self._active_browser(),
+                       proxy=self.proxy_var.get().strip() or None)
+        self._info_downloader = MediaDownloader()
+        threading.Thread(target=self._get_info, args=(url, options), daemon=True).start()
 
-    def _get_info(self, url: str):
-        browser = self._active_browser()
+    def _get_info(self, url: str, options: dict):
+        browser = options["cookies_from_browser"]
         try:
             if browser:
                 self._log(f"Получаю информацию через cookies из {browser}...")
             else:
                 self._log(f"Получаю информацию: {url}")
-            self.title_lbl.config(text="Название: загружаю...")
-            info = self.downloader.extract_info(
-                url,
-                cookies_file=self.cookies_path,
-                cookies_from_browser=browser,
-                proxy=self.proxy_var.get().strip() or None,
-            )
+            info = self._info_downloader.extract_info(url, **options)
             if not info:
                 raise RuntimeError("YouTube не вернул данные по этой ссылке")
 
-            is_playlist = "entries" in info
-            count = len(info.get("entries") or []) if is_playlist else 1
-            title = info.get("playlist_title") if is_playlist else info.get("title")
-            duration = format_duration(info.get("duration"))
-            channel = info.get("channel") or info.get("uploader") or "—"
-
-            self.after(0, lambda: self.title_lbl.config(text=f"Название: {title or '—'}"))
-            self.after(
-                0,
-                lambda: self.meta_lbl.config(
-                    text=f"{'Плейлист' if is_playlist else 'Видео'}"
-                    f" · {count} шт."
-                    f" · Длительность: {duration}"
-                    f" · Канал: {channel}"
-                    + (f" · Качество: {info['height']}p" if info.get("height") else "")
-                ),
-            )
-            self._log(f"Готово: {title or '—'} ({count} шт.)")
-            self.after(0, lambda: self._populate_formats(info))
-            if info.get("height"):
-                self._log(f"Доступные качества до {info['height']}p")
+            self._post_ui(lambda: self._present_info(url, info))
         except Exception as e:
             err = str(e)
             self._log(f"Ошибка: {err}")
-            messagebox.showerror("Ошибка получения информации", f"{err}{self._hint_for_error(err)}")
+            self._post_ui(lambda: self.title_lbl.config(text="Не удалось получить информацию"))
+            self._post_ui(lambda err=err: messagebox.showerror("Ошибка получения информации", f"{err}{self._hint_for_error(err)}"))
+        finally:
+            self._post_ui(self._finish_info)
+
+    def _present_info(self, url, info):
+        if self.url_var.get().strip() != url:
+            return
+        is_playlist = "entries" in info
+        count = len(info.get("entries") or []) if is_playlist else 1
+        title = info.get("playlist_title") or info.get("title") or "Без названия"
+        duration = format_duration(info.get("duration"))
+        channel = info.get("channel") or info.get("uploader") or "—"
+        self.title_lbl.config(text=f"Название: {title}")
+        self.meta_lbl.config(text=(
+            f"{'Плейлист' if is_playlist else 'Видео'} · {count} шт."
+            f" · Длительность: {duration} · Канал: {channel}"
+            + (f" · Качество: {info['height']}p" if info.get("height") else "")
+        ))
+        self._populate_formats(info)
+        self._log(f"Готово: {title} ({count} шт.)")
+
+    def _finish_info(self):
+        self._info_loading = False
+        self._info_downloader = None
+        self.btn_info.configure(state="normal", text="Получить информацию")
 
     @staticmethod
     def _hint_for_error(err: str) -> str:
@@ -1767,11 +1851,16 @@ class YTApp(ttkb.Window):
     # ---------- download ----------
 
     def _download_async(self):
-        if self.is_downloading:
+        if self.is_downloading or self._updating or self._info_loading:
             return
         url = self.url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Ссылка", "Вставьте ссылку на YouTube")
+        if not looks_like_url(url):
+            messagebox.showwarning("Ссылка", "Вставьте корректную ссылку на видео или плейлист.")
+            return
+        try:
+            start, end = self._playlist_range()
+        except ValueError as e:
+            messagebox.showwarning("Диапазон плейлиста", str(e))
             return
 
         out_dir = Path(self.output_dir_var.get() or str(get_default_download_dir()))
@@ -1785,6 +1874,8 @@ class YTApp(ttkb.Window):
             return
 
         self.is_downloading = True
+        self.downloader = MediaDownloader(progress_callback=self.on_progress)
+        self._save_config()
         self.btn_download.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress_bar["value"] = 0
@@ -1801,8 +1892,8 @@ class YTApp(ttkb.Window):
             custom_audio_only=custom_audio_only,
             audio_format=self.audio_format_var.get(),
             audio_quality=self.audio_quality_var.get(),
-            playlist_start=max(1, self.playlist_start_var.get() or 1),
-            playlist_end=0 if self.playlist_all_var.get() else max(0, self.playlist_end_var.get() or 0),
+            playlist_start=start,
+            playlist_end=end,
             cookies_file=self.cookies_path,
             cookies_from_browser=self._active_browser(),
             proxy=self.proxy_var.get().strip() or None,
@@ -1815,28 +1906,28 @@ class YTApp(ttkb.Window):
         try:
             self.downloader.download(**args)
         except Exception as e:
+            self.downloader.progress.status = "error"
+            self.downloader.progress.error = str(e)
             self._log(f"Критическая ошибка: {e}")
         finally:
             final = self.downloader.progress
             if final.status == "done":
                 self._log("Загрузка завершена успешно")
-                self.after(0, lambda: messagebox.showinfo("Готово", f"Файл сохранён в:\n{args['output_dir']}"))
+                self._post_ui(lambda: messagebox.showinfo("Готово", f"Файл сохранён в:\n{args['output_dir']}"))
             elif final.status == "cancelled":
                 self._log("Загрузка отменена")
             elif final.status == "error":
                 self._log(f"Ошибка загрузки: {final.error}")
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
+                self._post_ui(lambda: messagebox.showerror(
                         "Ошибка загрузки",
                         f"{final.error or 'Неизвестная ошибка'}{self._hint_for_error(final.error or '')}",
                     ),
                 )
-            self.after(0, self._finish)
-            self._save_config()
+            self._post_ui(self._finish)
 
     def _finish(self):
         self.is_downloading = False
+        self._save_config()
         self.btn_download.configure(state="normal")
         self.btn_stop.configure(state="disabled")
 
@@ -1849,14 +1940,14 @@ class YTApp(ttkb.Window):
         self.status_var.set("Останавливаю...")
 
     def on_progress(self, p: DownloadProgress):
-        self.after(0, lambda: self._render(p))
+        self._post_ui(lambda: self._render(p))
 
     def _render(self, p: DownloadProgress):
         if p.status == "extracting":
             if p.retry_message:
                 self.status_var.set(p.retry_message)
             else:
-                self.status_var.set("Получаю информацию с YouTube...")
+                self.status_var.set("Получаю информацию…")
         elif p.status == "downloading":
             counter = f" [{p.current_index}/{p.total_count}]" if p.is_playlist and p.total_count else ""
             self.status_var.set(f"Загрузка{counter}...")
@@ -1874,7 +1965,7 @@ class YTApp(ttkb.Window):
         elif p.status == "merging":
             self.progress_bar["value"] = 99
             self.percent_lbl.config(text="99%")
-            self.status_var.set("Склеиваю видео + аудио (FFmpeg)...")
+            self.status_var.set("Обрабатываю файл…")
             self.speed_var.set("Скорость: —")
         elif p.status == "done":
             self.progress_bar["value"] = 100
@@ -1896,10 +1987,10 @@ class YTApp(ttkb.Window):
             self.downloader.stop()
             self._queue_stop()
         self._save_config()
-        try:
-            stop_server()
-        except Exception:
-            pass
+        self._closing = True
+        if self._info_downloader is not None:
+            self._info_downloader.stop()
+        threading.Thread(target=stop_server).start()
         self.destroy()
 
 
